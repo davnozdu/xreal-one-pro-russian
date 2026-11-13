@@ -1,0 +1,46 @@
+name: macos-app
+
+# Builds the macOS .app of the Russian-menu updater on an Apple-silicon runner.
+# No device access: the workflow never talks to USB or flashes anything. The
+# app itself downloads firmware BINs from this repo's GitHub releases.
+on:
+  push:
+    branches: ['perf/**', 'installer/**']
+    tags: ['app-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-13 (Intel) is available on the free tier; the resulting .app runs
+    # natively on Intel Macs and under Rosetta 2 on Apple silicon (the One Pro
+    # owner's M2). Switch to macos-14 for a native arm64 build if the account
+    # gets access to Apple-silicon runners.
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build and self-test the .app
+        run: bash installer/build_macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XREAL-Russian-Updater-macos
+          path: |
+            outputs/macos/*.zip
+            outputs/macos/README.md
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/app-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" outputs/macos/*.zip \
+            --title "macOS GUI $GITHUB_REF_NAME" --prerelease \
+            --notes "Прошивальщик XREAL (macOS, Apple silicon). Скачивает прошивки из релизов этого репозитория."

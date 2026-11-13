@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import threading
 import traceback
@@ -14,7 +15,34 @@ from tkinter import ttk, messagebox, filedialog
 
 import backend
 import diagnostics
+import updates
 from version import VERSION
+
+
+def app_data_dir():
+    """Per-user folder for reports and downloads, correct for each OS."""
+    if sys.platform == 'win32':
+        base = Path(os.environ.get('LOCALAPPDATA', str(Path.home())))
+    elif sys.platform == 'darwin':
+        base = Path.home() / 'Library' / 'Application Support'
+    else:
+        base = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local' / 'share')))
+    return base / 'XREAL-Russian-Updater'
+
+
+def platform_fonts():
+    if sys.platform == 'darwin':
+        return 'Helvetica Neue', 'Menlo'
+    if sys.platform == 'win32':
+        return 'Segoe UI', 'Consolas'
+    return 'TkDefaultFont', 'TkFixedFont'
+
+
+def choose_theme(style):
+    names = style.theme_names()
+    preferred = {'darwin': 'aqua', 'win32': 'vista'}.get(sys.platform)
+    return (preferred if preferred in names else
+            'clam' if 'clam' in names else names[0])
 
 
 class App:
@@ -38,10 +66,11 @@ class App:
         root.geometry(f'{width}x{height}+{left+20}+{top+20}')
         root.minsize(min(320, width), min(220, height))
         root.protocol('WM_DELETE_WINDOW', self.close)
+        self.ui_font, self.mono_font = platform_fonts()
         style = ttk.Style()
-        style.theme_use('vista' if 'vista' in style.theme_names() else 'clam')
-        style.configure('TLabel', font=('Segoe UI', 11))
-        style.configure('TButton', font=('Segoe UI', 11), padding=8)
+        style.theme_use(choose_theme(style))
+        style.configure('TLabel', font=(self.ui_font, 11))
+        style.configure('TButton', font=(self.ui_font, 11), padding=8)
         shell = ttk.Frame(root)
         shell.pack(fill='both', expand=True)
         shell.rowconfigure(0, weight=1)
@@ -57,13 +86,13 @@ class App:
         frame = ttk.Frame(self.canvas, padding=20)
         self.content = frame
         self.content_window = self.canvas.create_window(0, 0, window=frame, anchor='nw')
-        ttk.Label(frame, text='Русское меню для XREAL One / One Pro / 1S', font=('Segoe UI', 19, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text='Русское меню для XREAL One / One Pro / 1S', font=(self.ui_font, 19, 'bold')).pack(anchor='w')
         ttk.Label(frame, text='Подключите очки по USB → выберите устройство и прошивку → установите.',
                   wraplength=650).pack(anchor='w', pady=(10, 18))
         ttk.Label(frame, text='1. Выберите очки').pack(anchor='w')
         row = ttk.Frame(frame)
         row.pack(fill='x', pady=(8, 16))
-        self.combo = ttk.Combobox(row, state='readonly', font=('Segoe UI', 11))
+        self.combo = ttk.Combobox(row, state='readonly', font=(self.ui_font, 11))
         self.combo.pack(fill='x')
         self.combo.bind('<<ComboboxSelected>>', self.selected)
         self.refresh_button = ttk.Button(row, text='Обновить список', command=self.refresh)
@@ -75,10 +104,22 @@ class App:
         ttk.Entry(frame, textvariable=self.file_name, state='readonly').pack(fill='x')
         self.browse_button = ttk.Button(frame, text='Выбрать BIN…', command=self.choose_firmware)
         self.browse_button.pack(anchor='w', pady=(6, 8))
+        ttk.Label(frame, text='…или скачайте прошивку прямо из релизов GitHub проекта (davnozdu).').pack(anchor='w', pady=(2, 6))
+        github_row = ttk.Frame(frame)
+        github_row.pack(fill='x', pady=(0, 8))
+        self.release_combo = ttk.Combobox(github_row, state='readonly', font=(self.ui_font, 11))
+        self.release_combo.pack(fill='x')
+        self.release_combo.bind('<<ComboboxSelected>>', self.release_selected)
+        self.fetch_button = ttk.Button(github_row, text='Обновить список с GitHub', command=self.fetch_releases)
+        self.fetch_button.pack(anchor='w', pady=(6, 0))
+        self.download_button = ttk.Button(github_row, text='Скачать и проверить', command=self.download_selected, state='disabled')
+        self.download_button.pack(anchor='w', pady=(6, 0))
+        self.release_assets = []
         self.description = ttk.Label(frame, wraplength=640, justify='left')
         self.description.pack(anchor='w', pady=(5, 10))
-        ttk.Label(frame, text='EXE и BIN скачиваются отдельно. Приложение проверяет формат, контрольные суммы '
-                  'и совместимость BIN перед записью. Русский заменяет польский язык, английский сохраняется.',
+        ttk.Label(frame, text='Приложение скачивает прошивку только с GitHub проекта и проверяет формат, '
+                  'контрольные суммы и совместимость BIN перед записью. Русский заменяет польский язык, '
+                  'английский сохраняется.',
                   wraplength=640).pack(anchor='w')
         ttk.Label(frame, text='Закройте страницу обновления XREAL. Не отключайте USB-кабель во время записи.',
                   foreground='#6b4c16', wraplength=640).pack(anchor='w', pady=(10, 14))
@@ -114,7 +155,7 @@ class App:
                   'Проверка ничего не прошивает и ничего не отправляет в интернет.', wraplength=650).pack(fill='x', padx=12, pady=8)
         area = ttk.Frame(window)
         area.pack(fill='both', expand=True, padx=12)
-        text = tk.Text(area, wrap='word', font=('Consolas', 10), width=30, height=10)
+        text = tk.Text(area, wrap='word', font=(self.mono_font, 10), width=30, height=10)
         scroll = ttk.Scrollbar(area, orient='vertical', command=text.yview)
         text.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
@@ -182,7 +223,8 @@ class App:
         # On unusually narrow/high-DPI displays keep every control reachable
         # through horizontal scrolling instead of clipping a button.
         minimum = max(button.winfo_reqwidth() for button in
-                      (self.install_button, self.verify_button, self.refresh_button, self.browse_button, self.diagnostic_button)) + 40
+                      (self.install_button, self.verify_button, self.refresh_button, self.browse_button,
+                       self.diagnostic_button, self.fetch_button, self.download_button)) + 40
         width = max(available, minimum)
         self.canvas.itemconfigure(self.content_window, width=width)
         for label in self.labels:
@@ -278,6 +320,60 @@ class App:
             self.events.put(('support', diagnostics.report('bin', 'validation', error=error), 0))
             self.events.put(('file_error', str(error), 0))
 
+    def release_selected(self, _event=None):
+        enabled = self.release_combo.current() >= 0 and not self.busy
+        self.download_button.configure(state='normal' if enabled else 'disabled')
+
+    def fetch_releases(self):
+        if self.busy:
+            return
+        self.busy = True
+        for control in (self.fetch_button, self.download_button, self.browse_button):
+            control.configure(state='disabled')
+        self.status.set('Загрузка списка прошивок с GitHub…')
+        threading.Thread(target=self.fetch_worker, daemon=True).start()
+
+    def fetch_worker(self):
+        try:
+            entries = []
+            for release in updates.list_releases():
+                for asset in release.bins:
+                    label = f"{release.tag or release.name}: {asset.name}"
+                    if release.prerelease:
+                        label += ' · пробная'
+                    entries.append((label, asset))
+            self.events.put(('releases', entries, 0))
+        except Exception as error:
+            self.events.put(('releases_error', str(error), 0))
+
+    def download_selected(self):
+        index = self.release_combo.current()
+        if self.busy or index < 0 or index >= len(self.release_assets):
+            return
+        asset = self.release_assets[index]
+        self.busy = True
+        self.firmware = None
+        self.firmware_path = None
+        self.build = None
+        self.selected()
+        for control in (self.fetch_button, self.download_button, self.browse_button):
+            control.configure(state='disabled')
+        self.progress['value'] = 0
+        self.status.set('Скачивание прошивки с GitHub…')
+        threading.Thread(target=self.download_worker, args=(asset,), daemon=True).start()
+
+    def download_worker(self, asset):
+        def progress(got, total):
+            percent = (got / total * 100) if total else 0
+            self.events.put(('progress', f'Скачивание с GitHub: {got // 1024} КБ', percent))
+        try:
+            path = updates.download(asset, app_data_dir() / 'downloads', progress=progress)
+            firmware, build = backend.identify_package(path, return_manifest=True)
+            self.events.put(('file_ok', str(path), (firmware, build)))
+        except Exception as error:
+            self.events.put(('support', diagnostics.report('bin', 'validation', error=error), 0))
+            self.events.put(('file_error', str(error), 0))
+
     def refresh(self):
         if self.busy:
             return
@@ -304,7 +400,8 @@ class App:
         firmware = self.firmware
         path = self.firmware_path
         for widget in [self.install_button, self.verify_button, self.refresh_button,
-                       self.combo, self.browse_button]:
+                       self.combo, self.browse_button, self.fetch_button,
+                       self.download_button, self.release_combo]:
             widget.configure(state='disabled')
         self.progress['value'] = 0
         self.status.set('Подготовка…')
@@ -320,12 +417,19 @@ class App:
             report['last_stage'] = text
             report['progress'] = percent
             self.events.put(('progress', text, percent))
+        caffeinate = None
         try:
             if path:
                 with Path(path).open('rb') as source:
                     report['package_sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
             if sys.platform == 'win32':
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+            elif sys.platform == 'darwin':
+                # Keep the Mac awake for the duration; killed in the finally block.
+                try:
+                    caffeinate = subprocess.Popen(['/usr/bin/caffeinate', '-i'])
+                except OSError:
+                    caffeinate = None
             action = backend.verify_only if verify_only else backend.update
             result = action(selected, progress, firmware=firmware, path=path)
             report.update(result or {})
@@ -334,7 +438,7 @@ class App:
         except Exception as e:
             report['error'] = str(e)
             report['exception'] = type(e).__name__
-            log = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'XREAL-Russian-Updater' / 'last-error.txt'
+            log = app_data_dir() / 'last-error.txt'
             try:
                 log.parent.mkdir(parents=True, exist_ok=True)
                 log.write_text(traceback.format_exc(), encoding='utf-8')
@@ -353,7 +457,7 @@ class App:
                 self.events.put(('error', support['code'] + ': ' + report.get('error', ''), 0))
             report['finished_utc'] = datetime.now(timezone.utc).isoformat()
             try:
-                folder = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'XREAL-Russian-Updater'
+                folder = app_data_dir()
                 folder.mkdir(parents=True, exist_ok=True)
                 name = datetime.now(timezone.utc).strftime('report-%Y%m%d-%H%M%S-%f.json')
                 (folder/name).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -362,6 +466,8 @@ class App:
                 pass
             if sys.platform == 'win32':
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+            if caffeinate is not None:
+                caffeinate.terminate()
 
     def poll(self):
         try:
@@ -373,15 +479,36 @@ class App:
                     self.busy = False
                     self.firmware, self.build = percent
                     self.firmware_path = Path(text)
+                    self.file_name.set(Path(text).name)
                     self.browse_button.configure(state='normal')
+                    self.fetch_button.configure(state='normal')
+                    self.release_selected()
                     self.status.set('BIN проверен. Выберите очки и запустите установку.')
                     self.firmware_changed()
                 elif kind == 'file_error':
                     self.busy = False
                     self.file_name.set('Файл не выбран')
                     self.browse_button.configure(state='normal')
+                    self.fetch_button.configure(state='normal')
+                    self.release_selected()
                     self.status.set('BIN не подходит: '+text)
                     messagebox.showerror('BIN не подходит', text, parent=self.root)
+                elif kind == 'releases':
+                    self.busy = False
+                    self.release_assets = [asset for _, asset in text]
+                    self.release_combo['values'] = [label for label, _ in text]
+                    self.release_combo.set('')
+                    self.fetch_button.configure(state='normal')
+                    self.browse_button.configure(state='normal')
+                    self.download_button.configure(state='disabled')
+                    self.status.set('Прошивки загружены в список. Выберите версию и нажмите «Скачать и проверить».'
+                                    if text else 'На GitHub пока нет опубликованных прошивок (.bin).')
+                elif kind == 'releases_error':
+                    self.busy = False
+                    self.fetch_button.configure(state='normal')
+                    self.browse_button.configure(state='normal')
+                    self.release_selected()
+                    self.status.set('Не удалось получить список с GitHub: '+text)
                 elif kind == 'progress':
                     self.status.set(text)
                     self.progress['value'] = percent
@@ -389,7 +516,10 @@ class App:
                     self.busy = False
                     self.refresh_button.configure(state='normal')
                     self.browse_button.configure(state='normal')
+                    self.fetch_button.configure(state='normal')
+                    self.download_button.configure(state='disabled')
                     self.combo.configure(state='readonly')
+                    self.release_combo.configure(state='readonly')
                     # Require a fresh selection before another write, especially after errors.
                     self.combo.set('')
                     if kind == 'error':
