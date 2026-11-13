@@ -19,6 +19,16 @@ import updates
 from version import VERSION
 
 
+def sha256_file(path):
+    """SHA256 of a file, streamed. Works on every supported Python (no 3.11
+    hashlib.file_digest dependency, so a 3.9/3.10 build flashes correctly)."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def app_data_dir():
     """Per-user folder for reports and downloads, correct for each OS."""
     if sys.platform == 'win32':
@@ -420,8 +430,7 @@ class App:
         caffeinate = None
         try:
             if path:
-                with Path(path).open('rb') as source:
-                    report['package_sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
+                report['package_sha256'] = sha256_file(path)
             if sys.platform == 'win32':
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
             elif sys.platform == 'darwin':

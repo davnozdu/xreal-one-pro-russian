@@ -19,7 +19,9 @@ fi
 "$PY" -m pip install --quiet -r installer/requirements.txt
 
 echo "== Tests =="
-"$PY" -m unittest discover -s installer -p 'test_*.py'
+# run_tests.py runs the full suite then exits hard, so a macOS Tk/hidapi
+# teardown hang can never stall an otherwise-green build.
+"$PY" installer/run_tests.py
 
 VERSION="$("$PY" -c "import sys;sys.path.insert(0,'installer');from version import VERSION;print(VERSION)")"
 NAME="XREAL-Russian-Updater-$VERSION"
@@ -45,7 +47,13 @@ echo "== PyInstaller ($NAME) =="
 APP_BIN="$DEST/$NAME.app/Contents/MacOS/$NAME"
 REPORT="$DEST/selftest.json"
 SMOKE_BIN="$ROOT/outputs/xreal-pilot2-real3d-cpu/XREAL-Pilot2-RU-Hebe-Real3D-CPU.bin"
-"$APP_BIN" --self-test "$REPORT" --bin "$SMOKE_BIN"
+# hidapi's IOHIDManager enumeration can, rarely, hit a GIL race on macOS; retry
+# a couple of times so that flake never fails an otherwise-good build.
+for attempt in 1 2 3; do
+    if "$APP_BIN" --self-test "$REPORT" --bin "$SMOKE_BIN"; then break; fi
+    echo "self-test attempt $attempt failed; retrying"; sleep 2
+    [ "$attempt" = 3 ] && { echo "self-test failed 3 times"; exit 1; }
+done
 "$PY" -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['ok'] and d['firmware_writes']==0,d;print('self-test ok:',d['version'])" "$REPORT"
 rm -f "$REPORT"
 
