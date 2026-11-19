@@ -1196,8 +1196,9 @@ static void zbuf_project_row(const u8 *z_row, u8 *out_row, u32 dw, u32 fractiona
     for (u32 x = 0; x < dw; ++x) {
         u32 m = ((u32)z_row[x] * gain_q8 + 128U) >> 8;
         scaled[x] = (u8)(m > 255U ? 255U : m);
-        out[x] = -1;
-        src_of[x] = -1;
+        out[x] = -2;
+        src_of[x] = -2;
+        __asm__ volatile("" : "+m"(out[x]), "+m"(src_of[x]));
     }
     for (u32 x = 0; x < dw; ++x) {
         u8 a = scaled[x ? x - 1 : x], b = scaled[x], c = scaled[x + 1 < dw ? x + 1 : x];
