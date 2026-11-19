@@ -1153,17 +1153,12 @@ int real3d_validate_frame_for_test(const struct real3d_frame *f) {
  * 2. Gain: displacement x REAL3D_GAIN_Q8/256 (1.3), clamped to 255, for more
  *    depth than the menu's strongest level. Interior smoothing is unchanged,
  *    so no staircase returns. */
-#define REAL3D_GAIN_Q8 256U   /* perf24: x1.0 — gain reintroduced bleed; depth via native "Real3D One Pro" row */
-#if REAL3D_GAIN_Q8 != 256U
-static u8 depth_pre[480 * 270];
-#endif
+#define REAL3D_GAIN_Q8 256U   /* kept at 256 for real3d_depth_prepass_for_test compatibility */
 static void depth_prepass(const u8 *z, u8 *out, u32 dw, u32 dh) {
     for (u32 y = 0; y < dh; ++y) {
         const u8 *row = z + (size_t)y * dw;
         u8 *o = out + (size_t)y * dw;
         for (u32 x = 0; x < dw; ++x) {
-            /* perf23: no dilation. The symmetric max filter also widened near
-             * objects on the side away from the warp and made halos worse. */
             u32 m = (row[x] * REAL3D_GAIN_Q8 + 128) >> 8;
             o[x] = (u8)(m > 255 ? 255 : m);
         }
@@ -1173,6 +1168,116 @@ static void depth_prepass(const u8 *z, u8 *out, u32 dw, u32 dh) {
 int real3d_depth_prepass_for_test(const u8 *z, u8 *out, u32 dw, u32 dh) {
     if (!z || !out || !dw || !dh) return -22;
     depth_prepass(z, out, dw, dh);
+    return 0;
+}
+
+/* perf28: 1D Forward Z-Buffer depth projection + background-side disocclusion
+ * fill + x1.35 depth gain (346/256).
+ * 1. Scale raw NPU depth by x1.35 (clamped to 255) and apply 1-cell horizontal
+ *    max dilation so an NPU depth mask 1 cell narrower than the RGB silhouette
+ *    covers the true object edge.
+ * 2. Forward-project each source cell xs to destination cell xd = xs - c0
+ *    (c0 = ceil(d / cell_unit)) with a Z-buffer (max depth wins). Steep
+ *    intermediate falling-edge ramp cells (> 1 cell drop on both sides) are
+ *    omitted so soft NPU right edges do not drag foreground into background.
+ *    Continuous surfaces (c0 <= c1 + 1) bridge 1-cell expansion gaps.
+ * 3. Fill empty disocclusion holes from the right (background side) with
+ *    (last_src_xs - xd) * cell_unit so disoccluded pixels sample the clean
+ *    background to the right of the foreground object (zero foreground ghost,
+ *    zero width loss, smooth ramp into warp_luma_bilinear_fast). */
+#define REAL3D_ZBUF_GAIN_Q8 346U
+static u8 depth_zbuf[480 * 270];
+
+static void zbuf_project_row(const u8 *z_row, u8 *out_row, u32 dw, u32 fractional_bits, u32 gain_q8) {
+    u32 cell_shift = fractional_bits + 2;
+    u32 cell_unit = 1U << cell_shift;
+    u8 scaled[480], zr[480];
+    short out[480], src_of[480];
+    for (u32 x = 0; x < dw; ++x) {
+        u32 m = ((u32)z_row[x] * gain_q8 + 128U) >> 8;
+        scaled[x] = (u8)(m > 255U ? 255U : m);
+        out[x] = -1;
+        src_of[x] = -1;
+    }
+    for (u32 x = 0; x < dw; ++x) {
+        u8 a = scaled[x ? x - 1 : x], b = scaled[x], c = scaled[x + 1 < dw ? x + 1 : x];
+        u8 mx = a > b ? a : b;
+        zr[x] = c > mx ? c : mx;
+    }
+    for (u32 xs = 0; xs < dw; ++xs) {
+        if (xs > 0 && xs + 1 < dw &&
+            (u32)zr[xs - 1] > (u32)zr[xs] + cell_unit &&
+            (u32)zr[xs] > (u32)zr[xs + 1] + cell_unit)
+            continue;
+        u32 d0 = zr[xs];
+        u32 c0 = (d0 + cell_unit - 1U) >> cell_shift;
+        int xd0 = (int)xs - (int)c0;
+        if (xd0 >= 0 && xd0 < (int)dw && (short)d0 > out[xd0]) {
+            out[xd0] = (short)d0;
+            src_of[xd0] = (short)xs;
+        }
+        if (xs + 1 < dw) {
+            u32 d1 = zr[xs + 1];
+            u32 c1 = (d1 + cell_unit - 1U) >> cell_shift;
+            if (c0 <= c1 + 1U) {
+                int xd1 = (int)(xs + 1) - (int)c1;
+                if (xd1 > xd0 + 1) {
+                    short dm = (short)((d0 + d1) >> 1);
+                    for (int xm = xd0 + 1; xm < xd1 && xm < (int)dw; ++xm) {
+                        if (xm >= 0 && dm > out[xm]) {
+                            out[xm] = dm;
+                            src_of[xm] = (short)(xs + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    u32 c_right = ((u32)zr[dw - 1] + cell_unit - 1U) >> cell_shift;
+    u32 tail_start = c_right < dw - 1 ? (dw - 1 - c_right) : 0;
+    for (u32 xd = tail_start; xd < dw; ++xd) {
+        if (out[xd] < 0) {
+            out[xd] = (short)zr[dw - 1];
+            src_of[xd] = (short)(dw - 1);
+        }
+    }
+    u32 last_s = dw - 1;
+    for (int xd = (int)dw - 1; xd >= 0; --xd) {
+        if (out[xd] >= 0) {
+            last_s = (u32)src_of[xd];
+            out_row[xd] = (u8)out[xd];
+        } else {
+            u32 fill = last_s > (u32)xd ? (last_s - (u32)xd) << cell_shift : 0;
+            out_row[xd] = (u8)(fill > 255U ? 255U : fill);
+        }
+    }
+}
+
+struct zbuf_job {
+    const u8 *z;
+    u8 *out;
+    u32 dw, dh, fractional_bits, gain_q8;
+    u32 *next;
+};
+
+static void *zbuf_worker(void *arg) {
+    struct zbuf_job *j = arg;
+    for (;;) {
+        u32 chunk = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
+        u32 first = chunk * SEGMENT_ROWS;
+        if (first >= j->dh) break;
+        u32 last = first + SEGMENT_ROWS < j->dh ? first + SEGMENT_ROWS : j->dh;
+        for (u32 y = first; y < last; ++y)
+            zbuf_project_row(j->z + (size_t)y * j->dw, j->out + (size_t)y * j->dw,
+                             j->dw, j->fractional_bits, j->gain_q8);
+    }
+    return NULL;
+}
+
+int real3d_zbuf_project_for_test(const u8 *z, u8 *out, u32 dw, u32 dh, u32 fractional_bits, u32 gain_q8) {
+    if (!z || !out || !dw || dw > 480 || !dh || fractional_bits < 2 || fractional_bits > 4) return -22;
+    for (u32 y = 0; y < dh; ++y)
+        zbuf_project_row(z + (size_t)y * dw, out + (size_t)y * dw, dw, fractional_bits, gain_q8);
     return 0;
 }
 
@@ -1227,19 +1332,21 @@ static int process_frame(const struct real3d_frame *f) {
 #endif
     if (!side_by_side && chroma_half && f->width == 1920 && f->height == 1080) {
         /* Four independent depth-row segments on the four Cortex-A53 cores. */
+        const u8 *zp = z;
+        if (f->depth_width <= 480 && f->depth_width * depth_height <= sizeof(depth_zbuf)) {
+            struct zbuf_job zjobs[4];
+            u32 znext = 0;
+            for (u32 i = 0; i < 4; ++i)
+                zjobs[i] = (struct zbuf_job){
+                    .z = z, .out = depth_zbuf, .dw = f->depth_width, .dh = depth_height,
+                    .fractional_bits = f->fractional_bits, .gain_q8 = REAL3D_ZBUF_GAIN_Q8,
+                    .next = &znext,
+                };
+            xreal_parallel_run(zbuf_worker, zjobs, sizeof(zjobs[0]), 4);
+            zp = depth_zbuf;
+        }
         struct segment_job jobs[4];
         u32 next_chunk = 0;
-        const u8 *zp = z;
-#if REAL3D_GAIN_Q8 != 256U
-        if (f->depth_width * depth_height <= sizeof(depth_pre)) {
-            depth_prepass(z, depth_pre, f->depth_width, depth_height);
-            zp = depth_pre;
-        }
-#endif
-        /* perf26: live path is perf24's single-eye bilinear. The perf25
-         * symmetric two-eye warp (warp_eye_range / symmetric_worker, kept with
-         * its test) gave NO added depth and 3x the cost on device: Pilot does
-         * not display our src buffer as the second eye. Do not re-enable. */
         for (u32 i = 0; i < 4; ++i) {
             jobs[i] = (struct segment_job){
                 .depth = zp, .depth_width = f->depth_width,

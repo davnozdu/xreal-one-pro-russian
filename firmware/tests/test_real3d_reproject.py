@@ -79,7 +79,28 @@ def main(path):
                 assert du.raw == oracle(u, depth, cw, ch, cs, dw, dh, bits, begin, end, 7, False), ('U', bits, kind)
                 assert dv.raw == oracle(v, depth, cw, ch, cs, dw, dh, bits, begin, end, 7, False), ('V', bits, kind)
                 cases += 1
-    print(f'Real3D perf23 reprojection oracle passed: {cases} cases (luma, joint U/V)')
+    zbuf = lib.real3d_zbuf_project_for_test
+    zbuf.argtypes = [C.c_char_p, C.c_char_p, C.c_uint, C.c_uint, C.c_uint, C.c_uint]
+    for v in (0, 17, 64, 200, 255):
+        out = C.create_string_buffer(480)
+        assert zbuf(bytes([v])*480, out, 480, 1, 3, 256) == 0
+        assert out.raw == bytes([v])*480, ('zbuf-const', v)
+    # Foreground object width preservation and zero ghosting under x1.35 gain
+    z_obj = bytearray([16]*480)
+    z_obj[200] = 80; z_obj[201] = 140
+    for c in range(202, 238): z_obj[c] = 160
+    z_obj[238] = 140; z_obj[239] = 80
+    out_obj = C.create_string_buffer(480)
+    assert zbuf(bytes(z_obj), out_obj, 480, 1, 3, 346) == 0
+    bilin = lib.real3d_warp_cells_bilinear_range_for_test
+    bilin.argtypes = [C.c_char_p, C.c_char_p, C.c_char_p] + [C.c_uint]*9
+    src_obj = bytes(220 if 800 <= x < 960 else 40 for x in range(1920))
+    dst_obj = C.create_string_buffer(1920*4)
+    assert bilin(src_obj*4, dst_obj, out_obj.raw, 1920, 4, 1920, 1920, 480, 1, 0, 1, 3) == 0
+    row0 = list(dst_obj.raw[:1920])
+    fg = [x for x, val in enumerate(row0) if val > 130]
+    assert 156 <= len(fg) <= 164 and fg[-1] - fg[0] + 1 == len(fg), ('zbuf-obj', len(fg), fg[0], fg[-1])
+    print(f'Real3D perf23/28 reprojection & Z-buffer oracle passed: {cases} cases (luma, joint U/V, 1D Z-buf)')
 
 
 if __name__ == '__main__':
