@@ -770,6 +770,7 @@ int real3d_warp_eye_range_for_test(const u8 *src, u8 *dst, const u8 *depth,
 
 struct segment_job {
     const u8 *src[3], *depth;
+    const u16 *depth_q5;    /* perf29: 1D Z-buffer projected Q5 luma shift map (0..1408) */
     u8 *dst[3];
     u8 *eye2[3];            /* perf25: second eye output (the mapped source planes); NULL = single eye */
     u32 width[3], height[3], src_stride[3], dst_stride[3];
@@ -1051,6 +1052,176 @@ __attribute__((unused)) static void *symmetric_worker(void *arg) {
     return NULL;
 }
 
+/* perf29: specialized Q5 luma warp with cliff-guarded horizontal smoothing.
+ * Reads pre-projected Q5 luma shifts (0..1408, i.e. 0..44 px) directly from
+ * depth_q5, avoiding u8 255 clipping. Smooth slopes (<= CLIFF_Q5 = 4 px/cell)
+ * get full bilinear smoothing (zero staircasing), while sharp depth cliffs
+ * (> 4 px/cell) do not blend across foreground/background boundaries (zero
+ * ghosts on thin details). */
+#define CLIFF_Q5 128U
+static int warp_luma_q5_fast(const u8 *src, u8 *dst, const u16 *depth_q5,
+                             u32 width, u32 height, u32 src_stride,
+                             u32 dst_stride, u32 depth_width,
+                             u32 depth_height, u32 begin, u32 end) {
+    if (!depth_width || !depth_height || depth_width > 480 ||
+        !src || !dst || !depth_q5 || src_stride < width || dst_stride < width ||
+        width != depth_width * 4 || height != depth_height * 4 ||
+        begin > end || end > depth_height) return -22;
+    u16 blend[480];
+    for (u32 zy = begin; zy < end; ++zy) {
+        const u16 *here = depth_q5 + (size_t)zy * depth_width;
+        const u16 *above = depth_q5 + (size_t)(zy ? zy - 1 : zy) * depth_width;
+        const u16 *below = depth_q5 + (size_t)(zy + 1 < depth_height ? zy + 1 : zy) * depth_width;
+        for (u32 ry = 0; ry < 4; ++ry) {
+            const u16 *other = ry < 2 ? above : below;
+            u32 w = (ry == 0 || ry == 3) ? 3U : 1U;
+            u32 inv = 8U - w;
+            u32 zx = 0;
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+            for (; zx + 8 <= depth_width; zx += 8) {
+                uint16x8_t h = vld1q_u16(here + zx);
+                uint16x8_t o = vld1q_u16(other + zx);
+                uint16x8_t b = vmlaq_n_u16(vmulq_n_u16(h, (u16)inv), o, (u16)w);
+                vst1q_u16(blend + zx, vrshrq_n_u16(b, 3));
+            }
+#endif
+            for (; zx < depth_width; ++zx)
+                blend[zx] = (u16)((here[zx] * inv + other[zx] * w + 4) >> 3);
+            u32 y = zy * 4 + ry;
+            const u8 *s = src + (size_t)y * src_stride;
+            u8 *d = dst + (size_t)y * dst_stride;
+            for (u32 cx = 0, x = 0; cx < depth_width; ++cx, x += 4) {
+                u32 mid = blend[cx];
+                u32 left = blend[cx ? cx - 1 : cx];
+                u32 right = blend[cx + 1 < depth_width ? cx + 1 : cx];
+                u32 dl = left > mid ? left - mid : mid - left;
+                u32 dr = right > mid ? right - mid : mid - right;
+                u32 l_eff = dl > CLIFF_Q5 ? mid : left;
+                u32 r_eff = dr > CLIFF_Q5 ? mid : right;
+                u32 dl_eff = l_eff > mid ? l_eff - mid : mid - l_eff;
+                u32 dr_eff = r_eff > mid ? r_eff - mid : mid - r_eff;
+                if (dl_eff > HFLAT || dr_eff > HFLAT) {
+                    u32 sh[4] = {
+                        (5 * mid + 3 * l_eff + 4) >> 3,
+                        (7 * mid + l_eff + 4) >> 3,
+                        (7 * mid + r_eff + 4) >> 3,
+                        (5 * mid + 3 * r_eff + 4) >> 3
+                    };
+                    u32 top = mid > l_eff ? mid : l_eff;
+                    if (r_eff > top) top = r_eff;
+                    if (sample_pixels4(d + x, s, x, sh, width)) {
+                    } else if ((((x + 3) * 32 + top) >> 5) + 1 < width) {
+                        for (u32 k = 0; k < 4; ++k) {
+                            u32 q = (x + k) * 32 + sh[k], i = q >> 5, f = q & 31;
+                            d[x + k] = (u8)((s[i] * (32 - f) + s[i + 1] * f + 16) >> 5);
+                        }
+                    } else {
+                        for (u32 k = 0; k < 4; ++k)
+                            d[x + k] = sample_q5(s, (int)((x + k) * 32 + sh[k]), width);
+                    }
+                    continue;
+                }
+                u32 q = x * 32 + mid, sx = q >> 5, frac = q & 31;
+                if (cx + 1 < depth_width && right == mid) {
+                    u32 r2 = blend[cx + 2 < depth_width ? cx + 2 : cx + 1];
+                    u32 dr2 = r2 > mid ? r2 - mid : mid - r2;
+                    if (dr2 <= HFLAT || dr2 > CLIFF_Q5) {
+                        if (!frac && sx + 8 <= width) {
+                            __builtin_memcpy(d + x, s + sx, 8);
+                            ++cx; x += 4;
+                            continue;
+                        }
+                        if (frac && sx + 8 < width) {
+                            sample_cell8(d + x, s + sx, frac);
+                            ++cx; x += 4;
+                            continue;
+                        }
+                    }
+                }
+                if (!frac && sx + 4 <= width) {
+                    __builtin_memcpy(d + x, s + sx, 4);
+                } else if (sx + 4 < width) {
+                    sample_cell4(d + x, s + sx, frac);
+                } else {
+                    for (u32 k = 0; k < 4; ++k)
+                        d[x + k] = sample_q5(s, (int)q + (int)k * 32, width);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* perf29: specialized joint U/V warp reading depth_q5 >> 1 (exact half of luma
+ * shift for 4:2:0 chroma, aligned with warp_luma_q5_fast). */
+static int warp_chroma_pair_q5_fast(const u8 *u_src, u8 *u_dst, const u8 *v_src, u8 *v_dst,
+                                    const u16 *depth_q5, u32 width, u32 height,
+                                    u32 u_src_stride, u32 u_dst_stride,
+                                    u32 v_src_stride, u32 v_dst_stride, u32 depth_width,
+                                    u32 depth_height, u32 begin, u32 end) {
+    if (!depth_width || !depth_height || depth_width > 480 ||
+        !u_src || !u_dst || !v_src || !v_dst || !depth_q5 ||
+        u_src_stride < width || u_dst_stride < width ||
+        v_src_stride < width || v_dst_stride < width ||
+        width != depth_width * 2 || height != depth_height * 2 ||
+        begin > end || end > depth_height) return -22;
+    u16 blend[480];
+    for (u32 zy = begin; zy < end; ++zy) {
+        const u16 *here = depth_q5 + (size_t)zy * depth_width;
+        const u16 *above = depth_q5 + (size_t)(zy ? zy - 1 : zy) * depth_width;
+        const u16 *below = depth_q5 + (size_t)(zy + 1 < depth_height ? zy + 1 : zy) * depth_width;
+        for (u32 ry = 0; ry < 2; ++ry) {
+            const u16 *other = ry == 0 ? above : below;
+            u32 zx = 0;
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+            for (; zx + 8 <= depth_width; zx += 8) {
+                uint16x8_t h = vld1q_u16(here + zx);
+                uint16x8_t o = vld1q_u16(other + zx);
+                uint16x8_t b = vaddq_u16(vaddq_u16(h, vshlq_n_u16(h, 1)), o);
+                vst1q_u16(blend + zx, vrshrq_n_u16(b, 3));  /* >>2 vertical blend, >>1 chroma half */
+            }
+#endif
+            for (; zx < depth_width; ++zx)
+                blend[zx] = (u16)((here[zx] * 3 + other[zx] + 4) >> 3);
+            u32 y = zy * 2 + ry;
+            const u8 *s1 = u_src + (size_t)y * u_src_stride;
+            u8 *d1 = u_dst + (size_t)y * u_dst_stride;
+            const u8 *s2 = v_src + (size_t)y * v_src_stride;
+            u8 *d2 = v_dst + (size_t)y * v_dst_stride;
+            for (u32 cx = 0, x = 0; cx < depth_width; ++cx, x += 2) {
+                u32 mid = blend[cx];
+                u32 q = x * 32 + mid, sx = q >> 5, frac = q & 31;
+                if (cx + 1 < depth_width && blend[cx + 1] == mid) {
+                    if (!frac && sx + 4 <= width) {
+                        __builtin_memcpy(d1 + x, s1 + sx, 4);
+                        __builtin_memcpy(d2 + x, s2 + sx, 4);
+                        ++cx; x += 2;
+                        continue;
+                    }
+                    if (frac && sx + 4 < width) {
+                        sample_cell4(d1 + x, s1 + sx, frac);
+                        sample_cell4(d2 + x, s2 + sx, frac);
+                        ++cx; x += 2;
+                        continue;
+                    }
+                }
+                if (!frac && sx + 2 <= width) {
+                    __builtin_memcpy(d1 + x, s1 + sx, 2);
+                    __builtin_memcpy(d2 + x, s2 + sx, 2);
+                } else if (sx + 2 < width) {
+                    sample_cell2_pair(d1 + x, s1 + sx, d2 + x, s2 + sx, frac);
+                } else {
+                    for (u32 k = 0; k < 2; ++k) {
+                        d1[x + k] = sample_q5(s1, (int)q + (int)k * 32, width);
+                        d2[x + k] = sample_q5(s2, (int)q + (int)k * 32, width);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static void *segment_worker(void *arg) {
     struct segment_job *j = arg;
     j->rc = 0;
@@ -1059,18 +1230,21 @@ static void *segment_worker(void *arg) {
         u32 first = j->begin + chunk * SEGMENT_ROWS;
         if (first >= j->end) break;
         u32 last = first + SEGMENT_ROWS < j->end ? first + SEGMENT_ROWS : j->end;
-        /* Luma: bilinear displacement + 4-tap Catmull-Rom (perf15). Chroma:
-         * vertical blend, U and V in one pass sharing the geometry (perf15,
-         * byte-identical to two passes). */
-        /* perf20: luma back to the perf5/perf11 path (bilinear displacement,
-         * 2-tap sampling). On the device the cubic + edge-aware variants
-         * cost 22-28 ms (36 frames/s) and perf19's hard layer selection
-         * brought back halos and staircase. They stay in this file with
-         * tests (warp_luma_cubic_range / warp_luma_jbu_range), unused. */
-        /* perf24: reprojection (perf23) dragged the bright background into the
-         * near object's edge — white halos, worse with the x1.5 gain. Back to
-         * the artifact-free bilinear 2-tap path (perf5/perf11). */
-        int rc = warp_plane_cells_bilinear_range(j->src[0], j->dst[0], j->depth, j->width[0],
+        int rc;
+        if (j->depth_q5) {
+            rc = warp_luma_q5_fast(j->src[0], j->dst[0], j->depth_q5, j->width[0],
+                                   j->height[0], j->src_stride[0], j->dst_stride[0],
+                                   j->depth_width, j->depth_height, first, last);
+            if (rc && !j->rc) j->rc = rc;
+            rc = warp_chroma_pair_q5_fast(j->src[1], j->dst[1], j->src[2], j->dst[2],
+                                          j->depth_q5, j->width[1], j->height[1],
+                                          j->src_stride[1], j->dst_stride[1],
+                                          j->src_stride[2], j->dst_stride[2],
+                                          j->depth_width, j->depth_height, first, last);
+            if (rc && !j->rc) j->rc = rc;
+            continue;
+        }
+        rc = warp_plane_cells_bilinear_range(j->src[0], j->dst[0], j->depth, j->width[0],
                                        j->height[0], j->src_stride[0], j->dst_stride[0],
                                        j->depth_width, j->depth_height, first, last,
                                        j->fractional_bits);
@@ -1186,7 +1360,6 @@ int real3d_depth_prepass_for_test(const u8 *z, u8 *out, u32 dw, u32 dh) {
  *    background to the right of the foreground object (zero foreground ghost,
  *    zero width loss, smooth ramp into warp_luma_bilinear_fast). */
 #define REAL3D_ZBUF_GAIN_Q8 346U
-static u8 depth_zbuf[480 * 270];
 
 static void zbuf_project_row(const u8 *z_row, u8 *out_row, u32 dw, u32 fractional_bits, u32 gain_q8) {
     u32 cell_shift = fractional_bits + 2;
@@ -1254,32 +1427,160 @@ static void zbuf_project_row(const u8 *z_row, u8 *out_row, u32 dw, u32 fractiona
     }
 }
 
-struct zbuf_job {
+int real3d_zbuf_project_for_test(const u8 *z, u8 *out, u32 dw, u32 dh, u32 fractional_bits, u32 gain_q8) {
+    if (!z || !out || !dw || dw > 480 || !dh || fractional_bits < 2 || fractional_bits > 4) return -22;
+    for (u32 y = 0; y < dh; ++y)
+        zbuf_project_row(z + (size_t)y * dw, out + (size_t)y * dw, dw, fractional_bits, gain_q8);
+    return 0;
+}
+
+/* perf29: adaptive strong 3D in Q5 (0..1408, up to 44 px — no u8 255 cap!).
+ * Computes a 256-bin histogram of the 480x270 depth map, tracks p05/p95 with
+ * a smooth EMA (alpha = 1/16, no temporal pumping), and targets ~38 px (1216 Q5)
+ * relative stereo disparity between p05 and p95 (gain 1.8x..3.2x, soft-clamped
+ * at 44 px, fading to 1.0x on flat 2D menus/title cards where span < 8).
+ * No blind dilation -> thin details (wires, hair, text) keep exact width and
+ * zero background-grab; paired with cliff-guarded warp_luma_q5_fast -> zero
+ * ghosting and zero staircasing. */
+#define REAL3D_Q5_TARGET 1216U   /* 38.0 luma px between p05 and p95 */
+#define REAL3D_Q5_MAX    1408U   /* 44.0 luma px hard cap */
+#define REAL3D_GAIN_MIN  460U    /* 1.80x minimum boost on 3D scenes */
+#define REAL3D_GAIN_MAX  820U    /* 3.20x maximum boost on low-contrast scenes */
+static u16 depth_q5_buf[480 * 270];
+static int ema_ready, ema_p05_q8, ema_p95_q8;
+
+static void compute_adaptive_depth_params(const u8 *z, u32 size, u32 fractional_bits,
+                                          u32 *z_floor_out, u32 *scale_q8_out) {
+    u32 hist[256];
+    for (u32 i = 0; i < 256; ++i) {
+        hist[i] = 0;
+        __asm__ volatile("" : "+m"(hist[i]));
+    }
+    for (u32 i = 0; i < size; ++i) ++hist[z[i]];
+    u32 lo_target = size / 20U, hi_target = size - lo_target;
+    u32 acc = 0, p05 = 0, p95 = 255;
+    int got_lo = 0;
+    for (u32 i = 0; i < 256; ++i) {
+        acc += hist[i];
+        if (!got_lo && acc >= lo_target) { p05 = i; got_lo = 1; }
+        if (acc >= hi_target) { p95 = i; break; }
+    }
+    if (!ema_ready) {
+        ema_p05_q8 = (int)(p05 << 8);
+        ema_p95_q8 = (int)(p95 << 8);
+        ema_ready = 1;
+    } else {
+        ema_p05_q8 += ((int)(p05 << 8) - ema_p05_q8) >> 4;
+        ema_p95_q8 += ((int)(p95 << 8) - ema_p95_q8) >> 4;
+    }
+    int span = (ema_p95_q8 - ema_p05_q8) >> 8;
+    if (span < 8) {
+        *z_floor_out = 0;
+        *scale_q8_out = 256U;
+        return;
+    }
+    u32 raw_q5 = (u32)span << (5 - fractional_bits);
+    u32 scale_q8 = (REAL3D_Q5_TARGET * 256U) / (raw_q5 ? raw_q5 : 1U);
+    if (scale_q8 < REAL3D_GAIN_MIN) scale_q8 = REAL3D_GAIN_MIN;
+    if (scale_q8 > REAL3D_GAIN_MAX) scale_q8 = REAL3D_GAIN_MAX;
+    *z_floor_out = (u32)(ema_p05_q8 > 0 ? (ema_p05_q8 >> 8) : 0);
+    *scale_q8_out = scale_q8;
+}
+
+static void zbuf_q5_project_row(const u8 *z_row, u16 *out_row, u32 dw,
+                                u32 fractional_bits, u32 z_floor, u32 scale_q8) {
+    u32 sh = 5 - fractional_bits;
+    u16 d_src[480];
+    short out[480], src_of[480];
+    for (u32 x = 0; x < dw; ++x) {
+        u32 dz = z_row[x] > z_floor ? (u32)z_row[x] - z_floor : 0U;
+        u32 dq = ((dz << sh) * scale_q8 + 128U) >> 8;
+        d_src[x] = (u16)(dq > REAL3D_Q5_MAX ? REAL3D_Q5_MAX : dq);
+        out[x] = -2;
+        src_of[x] = -2;
+        __asm__ volatile("" : "+m"(out[x]), "+m"(src_of[x]));
+    }
+    for (u32 xs = 0; xs < dw; ++xs) {
+        if (xs > 0 && xs + 1 < dw &&
+            (u32)d_src[xs - 1] > (u32)d_src[xs] + 128U &&
+            (u32)d_src[xs] > (u32)d_src[xs + 1] + 128U)
+            continue;
+        u32 d0 = d_src[xs];
+        u32 c0 = (d0 + 64U) >> 7;
+        int xd0 = (int)xs - (int)c0;
+        if (xd0 >= 0 && xd0 < (int)dw && (short)d0 > out[xd0]) {
+            out[xd0] = (short)d0;
+            src_of[xd0] = (short)xs;
+        }
+        if (xs + 1 < dw) {
+            u32 d1 = d_src[xs + 1];
+            u32 c1 = (d1 + 64U) >> 7;
+            if (c0 <= c1 + 1U) {
+                int xd1 = (int)(xs + 1) - (int)c1;
+                if (xd1 > xd0 + 1) {
+                    short dm = (short)((d0 + d1) >> 1);
+                    for (int xm = xd0 + 1; xm < xd1 && xm < (int)dw; ++xm) {
+                        if (xm >= 0 && dm > out[xm]) {
+                            out[xm] = dm;
+                            src_of[xm] = (short)(xs + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    u32 c_right = ((u32)d_src[dw - 1] + 64U) >> 7;
+    u32 tail_start = c_right < dw - 1 ? (dw - 1 - c_right) : 0;
+    for (u32 xd = tail_start; xd < dw; ++xd) {
+        if (out[xd] < 0) {
+            out[xd] = (short)d_src[dw - 1];
+            src_of[xd] = (short)(dw - 1);
+        }
+    }
+    u32 last_s = dw - 1;
+    for (int xd = (int)dw - 1; xd >= 0; --xd) {
+        if (out[xd] >= 0) {
+            last_s = (u32)src_of[xd];
+            out_row[xd] = (u16)out[xd];
+        } else {
+            u32 fill = last_s > (u32)xd ? (last_s - (u32)xd) << 7 : 0;
+            out_row[xd] = (u16)(fill > REAL3D_Q5_MAX ? REAL3D_Q5_MAX : fill);
+        }
+    }
+}
+
+struct zbuf_q5_job {
     const u8 *z;
-    u8 *out;
-    u32 dw, dh, fractional_bits, gain_q8;
+    u16 *out;
+    u32 dw, dh, fractional_bits, z_floor, scale_q8;
     u32 *next;
 };
 
-static void *zbuf_worker(void *arg) {
-    struct zbuf_job *j = arg;
+static void *zbuf_q5_worker(void *arg) {
+    struct zbuf_q5_job *j = arg;
     for (;;) {
         u32 chunk = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
         u32 first = chunk * SEGMENT_ROWS;
         if (first >= j->dh) break;
         u32 last = first + SEGMENT_ROWS < j->dh ? first + SEGMENT_ROWS : j->dh;
         for (u32 y = first; y < last; ++y)
-            zbuf_project_row(j->z + (size_t)y * j->dw, j->out + (size_t)y * j->dw,
-                             j->dw, j->fractional_bits, j->gain_q8);
+            zbuf_q5_project_row(j->z + (size_t)y * j->dw, j->out + (size_t)y * j->dw,
+                                j->dw, j->fractional_bits, j->z_floor, j->scale_q8);
     }
     return NULL;
 }
 
-int real3d_zbuf_project_for_test(const u8 *z, u8 *out, u32 dw, u32 dh, u32 fractional_bits, u32 gain_q8) {
-    if (!z || !out || !dw || dw > 480 || !dh || fractional_bits < 2 || fractional_bits > 4) return -22;
+int real3d_zbuf_q5_warp_for_test(const u8 *src, u8 *dst, const u8 *z,
+                                 u32 width, u32 height, u32 stride,
+                                 u32 dw, u32 dh, u32 fractional_bits,
+                                 u32 z_floor, u32 scale_q8) {
+    if (!src || !dst || !z || !dw || dw > 480 || !dh || dw * dh > 480 * 270 ||
+        fractional_bits < 2 || fractional_bits > 4) return -22;
     for (u32 y = 0; y < dh; ++y)
-        zbuf_project_row(z + (size_t)y * dw, out + (size_t)y * dw, dw, fractional_bits, gain_q8);
-    return 0;
+        zbuf_q5_project_row(z + (size_t)y * dw, depth_q5_buf + (size_t)y * dw,
+                            dw, fractional_bits, z_floor, scale_q8);
+    return warp_luma_q5_fast(src, dst, depth_q5_buf, width, height, stride, stride,
+                             dw, dh, 0, dh);
 }
 
 static int process_frame(const struct real3d_frame *f) {
@@ -1333,24 +1634,27 @@ static int process_frame(const struct real3d_frame *f) {
 #endif
     if (!side_by_side && chroma_half && f->width == 1920 && f->height == 1080) {
         /* Four independent depth-row segments on the four Cortex-A53 cores. */
-        const u8 *zp = z;
-        if (f->depth_width <= 480 && f->depth_width * depth_height <= sizeof(depth_zbuf)) {
-            struct zbuf_job zjobs[4];
+        const u16 *dq5 = NULL;
+        if (f->depth_width <= 480 && f->depth_width * depth_height <= 480U * 270U) {
+            u32 z_floor = 0, scale_q8 = 256U;
+            compute_adaptive_depth_params(z, f->depth_width * depth_height,
+                                          f->fractional_bits, &z_floor, &scale_q8);
+            struct zbuf_q5_job zjobs[4];
             u32 znext = 0;
             for (u32 i = 0; i < 4; ++i)
-                zjobs[i] = (struct zbuf_job){
-                    .z = z, .out = depth_zbuf, .dw = f->depth_width, .dh = depth_height,
-                    .fractional_bits = f->fractional_bits, .gain_q8 = REAL3D_ZBUF_GAIN_Q8,
-                    .next = &znext,
+                zjobs[i] = (struct zbuf_q5_job){
+                    .z = z, .out = depth_q5_buf, .dw = f->depth_width, .dh = depth_height,
+                    .fractional_bits = f->fractional_bits, .z_floor = z_floor,
+                    .scale_q8 = scale_q8, .next = &znext,
                 };
-            xreal_parallel_run(zbuf_worker, zjobs, sizeof(zjobs[0]), 4);
-            zp = depth_zbuf;
+            xreal_parallel_run(zbuf_q5_worker, zjobs, sizeof(zjobs[0]), 4);
+            dq5 = depth_q5_buf;
         }
         struct segment_job jobs[4];
         u32 next_chunk = 0;
         for (u32 i = 0; i < 4; ++i) {
             jobs[i] = (struct segment_job){
-                .depth = zp, .depth_width = f->depth_width,
+                .depth = z, .depth_q5 = dq5, .depth_width = f->depth_width,
                 .depth_height = depth_height, .fractional_bits = f->fractional_bits,
                 .begin = 0, .end = depth_height, .next = &next_chunk, .rc = 0,
             };
@@ -1449,6 +1753,7 @@ int xreal_real3d_rpc(u32 core, const struct rpc *call, u32 sync) {
         int rc = set_result(result, 0);
         initialized = rc == 0;
         frames = 0;
+        ema_ready = ema_p05_q8 = ema_p95_q8 = 0;
         pace_last_start = pace_slept_us = pace_late = 0;
         diagnostic("init", NULL, rc);
         return rc;

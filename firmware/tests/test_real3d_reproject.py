@@ -100,7 +100,21 @@ def main(path):
     row0 = list(dst_obj.raw[:1920])
     fg = [x for x, val in enumerate(row0) if val > 130]
     assert 156 <= len(fg) <= 164 and fg[-1] - fg[0] + 1 == len(fg), ('zbuf-obj', len(fg), fg[0], fg[-1])
-    print(f'Real3D perf23/28 reprojection & Z-buffer oracle passed: {cases} cases (luma, joint U/V, 1D Z-buf)')
+    # perf29: adaptive Q5 Z-buffer + cliff-guarded warp on thin 8px wire + 160px object at +28px shift
+    q5w = lib.real3d_zbuf_q5_warp_for_test
+    q5w.argtypes = [C.c_char_p, C.c_char_p, C.c_char_p] + [C.c_uint]*8
+    z_wire = bytearray([20]*480)
+    z_wire[100] = 90; z_wire[101] = 90
+    for c in range(200, 240): z_wire[c] = 90
+    src_wire = bytes(220 if (400 <= x < 408 or 800 <= x < 960) else 40 for x in range(1920))
+    dst_wire = C.create_string_buffer(1920*4)
+    assert q5w(src_wire*4, dst_wire, bytes(z_wire), 1920, 4, 1920, 480, 1, 3, 20, 820) == 0
+    rw = list(dst_wire.raw[:1920])
+    wire = [x for x in range(300, 500) if rw[x] > 130]
+    obj = [x for x in range(700, 1000) if rw[x] > 130]
+    assert len(wire) == 8 and wire[-1] - wire[0] + 1 == 8, ('q5-wire', wire)
+    assert len(obj) == 160 and obj[-1] - obj[0] + 1 == 160, ('q5-obj', len(obj), obj[0], obj[-1])
+    print(f'Real3D perf23/28/29 reprojection & Q5 Z-buffer oracle passed: {cases} cases (luma, joint U/V, 1D Z-buf, thin-wire)')
 
 
 if __name__ == '__main__':

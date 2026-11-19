@@ -370,7 +370,7 @@ def build(args):
         perf={'base_bin_sha256': RC7_SHA, 'base_release': original['release'],
               'changed_files': [ADAPTER, MANIFEST, CHECKSUMS],
               'aihdr': 'compact16 (8-pixel 16-bit NEON, precomputed axis weights, 289 KiB table, no autotune); dynamic row scheduling; dense only as fallback; bounded log rotation',
-              'real3d_proplus': '1D forward Z-buffer depth projection with background-side disocclusion fill and x1.35 gain, specialized luma bilinear (8-pixel flat coalescing, NEON TBL gather) and joint U/V NEON paths, global flush, dynamic row scheduling, bounded log rotation',
+              'real3d_proplus': 'adaptive Q5 1D forward Z-buffer (target 38 px, cap 44 px, gain 1.8-3.2x, EMA p05/p95, background-side disocclusion fill) + cliff-guarded luma bilinear and joint U/V NEON paths, global flush, bounded log rotation',
               'menu_and_osd': 'unchanged rc7 (compare_ui.c and patched libnr_osd.so)',
               'abi': abi_report})
     changed_expected = [ADAPTER, MANIFEST, CHECKSUMS]
