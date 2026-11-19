@@ -46,8 +46,13 @@ for channel,size in enumerate((1920*1080,960*540,960*540)):
 assert call('ArArmWarp2DTo3DProcess',f)==0 and status().value==0
 for channel,size in enumerate((1920*1080,960*540,960*540)):
     assert C.string_at(lib.test_memory(f.dst[channel]),size)==bytes([80+channel*50])*size
-# Runtime failures must replace a previous successful completion.
+# Second frame with identical MMZ addresses must hit the mmap cache (0 new mmaps).
+lib.test_faults(0,0)
+assert call('ArArmWarp2DTo3DProcess',f)==0 and lib.test_mappings()==0
+# Runtime failures must replace a previous successful completion (re-init clears mmap cache).
 for mapping,flushing in ((f.depth,0),(f.src[1],0),(0,f.dst[0])):
+    lib.test_faults(0,0)
+    assert call('ArArmWarp2DTo3DInit',result)==0
     status().value=0
     lib.test_faults(mapping,flushing)
     assert call('ArArmWarp2DTo3DProcess',f)==-5

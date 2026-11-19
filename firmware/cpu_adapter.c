@@ -61,13 +61,21 @@ extern int xreal_build_compact_table_range(const u16 *,u32 *,u32,u32);
 extern int xreal_compact_rgb_lut(const u32 *,u8 *,u8 *,u8 *,u32,u32,u32,u32,u32);
 extern int xreal_compact16_rgb_lut(const u32 *,u8 *,u8 *,u8 *,u32,u32,u32,u32,u32);
 extern int xreal_blocks_rgb_lut(const u32 *,u8 *,u8 *,u8 *,u32,u32,u32,u32,u32);
+extern u64 xreal_tetra_table_bytes(void);
+extern int xreal_build_tetra_table(const u16 *,u32 *);
+extern int xreal_tetra_rgb_lut(const u32 *,u8 *,u8 *,u8 *,u32,u32,u32,u32,u32);
 extern void xreal_blocks_take_counts(unsigned long long *,unsigned long long *);
-/* Kernels: 0 dense (rc7 table, only when the compact table cannot be built),
- * 1 compact, 2 compact16 (289 KiB table, 8-pixel 16-bit NEON with precomputed
- * weights, within one level of the cube). perf21 coef autotune removed after
- * coef lost on device (92 vs 37 ms). */
-static u32 *compact;
+/* Kernels: 0 dense (fallback), 2 compact16 (289 KiB L2 table, 8-px NEON),
+ * 5 tetra (19.7 KiB L1-resident table, 4-px NEON). Short 6-frame autotune
+ * picks the faster kernel on the glasses and frees the other table. */
+#define TUNE 6
+static u32 *compact, *tetra;
 static int choice=-1;
+static u32 tune_c16[TUNE], tune_tet[TUNE], tuned_c16, tuned_tet;
+static u32 median_u32(u32 *v,u32 n) {
+    for(u32 i=1;i<n;i++)for(u32 j=i;j && v[j-1]>v[j];j--){u32 x=v[j];v[j]=v[j-1];v[j-1]=x;}
+    return v[n/2];
+}
 static void trace(const char *stage,u64 p,u32 n,long value) {
     char line[200];
     int count=snprintf(line,sizeof(line),"CPU diagnostic: %s phys=0x%lx size=%u value=%ld\n",stage,p,n,value);
@@ -96,21 +104,57 @@ struct frame_args {u64 planes[3],result; u32 strides[3],width,height;};
 _Static_assert(__builtin_offsetof(struct rpc,args)==40,"RPC ABI");
 _Static_assert(__builtin_offsetof(struct frame_args,width)==44,"frame ABI");
 static int valid(u64 p,u64 n) {return n && p>=0x33000000 && p<0x40000000 && n<=0x40000000-p;}
+/* perf30: 24-entry MMZ mmap cache for Pilot's fixed rotating ring buffers.
+ * Eliminates per-frame mmap_cache + munmap (~2.5-3.3 ms/frame on A53) while
+ * always invalidating input cache before read and flushing after write.
+ * Cleared on Init, Close, and any map error. */
+#define MMZ_CACHE_CAP 24
+struct mmz_slot {u64 pa; u32 size; void *va;};
+static struct mmz_slot mmz_cache[MMZ_CACHE_CAP];
+static u32 mmz_evict_idx;
+static void mmz_cache_clear(void) {
+    for(u32 i=0;i<MMZ_CACHE_CAP;i++) {
+        if(mmz_cache[i].va) {
+            ar_hal_sys_munmap(mmz_cache[i].va,mmz_cache[i].size);
+            mmz_cache[i].va=(void *)0;
+            mmz_cache[i].pa=0;
+            mmz_cache[i].size=0;
+        }
+    }
+    mmz_evict_idx=0;
+}
 static void *map(u64 p,u32 n) {
     if(!valid(p,n)){trace("invalid physical range",p,n,0);return (void *)0;}
-    void *v=ar_hal_sys_mmap_cache(p,n);
-    if(!v || v==(void *)-1){trace("mmap_cache failed",p,n,(long)v);return (void *)0;}
+    void *v=(void *)0;
+    for(u32 i=0;i<MMZ_CACHE_CAP;i++) {
+        if(mmz_cache[i].va && mmz_cache[i].pa==p && mmz_cache[i].size==n) {
+            v=mmz_cache[i].va;
+            break;
+        }
+    }
+    if(!v) {
+        v=ar_hal_sys_mmap_cache(p,n);
+        if(!v || v==(void *)-1){trace("mmap_cache failed",p,n,(long)v);return (void *)0;}
+        u32 slot=MMZ_CACHE_CAP;
+        for(u32 i=0;i<MMZ_CACHE_CAP;i++)if(!mmz_cache[i].va){slot=i;break;}
+        if(slot==MMZ_CACHE_CAP) {
+            slot=mmz_evict_idx;
+            mmz_evict_idx=(mmz_evict_idx+1)%MMZ_CACHE_CAP;
+            ar_hal_sys_munmap(mmz_cache[slot].va,mmz_cache[slot].size);
+        }
+        mmz_cache[slot]=(struct mmz_slot){p,n,v};
+    }
     int rc=ar_hal_sys_mmz_invalid_cache(p,v,n);
     /* This vendor build returns 0x80028003 when the invalidate ioctl
      * succeeds (confirmed in libhal_sys.so and on the physical device). */
-    if(rc!=0 && (u32)rc!=0x80028003u){trace("invalid_cache failed",p,n,rc);ar_hal_sys_munmap(v,n);return (void *)0;}
+    if(rc!=0 && (u32)rc!=0x80028003u){trace("invalid_cache failed",p,n,rc);mmz_cache_clear();return (void *)0;}
     return v;
 }
 static int result(u64 p,int value) {
     int *v=map(p,64);if(!v){trace("result map failed",p,64,value);return -5;}
     *v=value;int rc=ar_hal_sys_mmz_flush_cache_pa(p,64);
     if(rc)trace("result PA flush failed",p,64,rc);
-    ar_hal_sys_munmap(v,64);return rc ? -5 : 0;
+    return rc ? -5 : 0;
 }
 struct build_job {const u16 *cube;u64 *table;u32 begin,end;int rc;};
 static void *build_worker(void *arg) {
@@ -129,11 +173,13 @@ static void *compact_worker(void *arg) {
  * four A53 cores, so fixed quarters made every frame wait for the most
  * interrupted core; now the idle cores finish its remaining bands. */
 #define CHUNK 24
-struct rgb_frame {const u64 *table;const u32 *compact;int kernel;u8 *planes[3];u32 strides[3],width,height,chunks,next;int rc;};
+struct rgb_frame {const u64 *table;const u32 *compact;const u32 *tetra;int kernel;u8 *planes[3];u32 strides[3],width,height,chunks,next;int rc;};
 struct rgb_job {struct rgb_frame *f;int rc;};
 static int rgb_rows(const struct rgb_frame *f,u32 begin,u32 rows) {
     u8 *p[3];
     for(u32 c=0;c<3;c++)p[c]=f->planes[c]+(u64)begin*f->strides[c];
+    if(f->kernel==5)
+        return xreal_tetra_rgb_lut(f->tetra,p[0],p[1],p[2],f->strides[0],f->strides[1],f->strides[2],f->width,rows);
     if(f->kernel==3)
         return xreal_blocks_rgb_lut(f->compact,p[0],p[1],p[2],f->strides[0],f->strides[1],f->strides[2],f->width,rows);
     if(f->kernel==2)
@@ -154,8 +200,8 @@ static void *rgb_worker(void *arg) {
     }
     return (void *)0;
 }
-static int rgb_parallel(const u64 *table,const u32 *small,int kernel,u8 *planes[3],const u32 strides[3],u32 w,u32 h) {
-    struct rgb_frame f={table,small,kernel,{planes[0],planes[1],planes[2]},
+static int rgb_parallel(const u64 *table,const u32 *small,const u32 *tet,int kernel,u8 *planes[3],const u32 strides[3],u32 w,u32 h) {
+    struct rgb_frame f={table,small,tet,kernel,{planes[0],planes[1],planes[2]},
                         {strides[0],strides[1],strides[2]},w,h,(h+CHUNK-1)/CHUNK,0,0};
     struct rgb_job jobs[4];
     for(u32 i=0;i<4;i++)jobs[i]=(struct rgb_job){&f,0};
@@ -234,7 +280,11 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         /* Validate the result before allocating or changing current state. */
         if(!valid(a->result,64)||!valid(a->lut,14739)||
            (a->result<a->lut+14739 && a->lut<a->result+64))return -22;
-        u8 *p=map(a->lut,14739);if(!p){trace("LUT map failed",a->lut,14739,0);return -5;}
+        mmz_cache_clear();
+        u8 *p=ar_hal_sys_mmap_cache(a->lut,14739);
+        if(!p || p==(void *)-1){trace("LUT map failed",a->lut,14739,0);return -5;}
+        {int irc=ar_hal_sys_mmz_invalid_cache(a->lut,p,14739);
+         if(irc!=0 && (u32)irc!=0x80028003u){ar_hal_sys_munmap(p,14739);return -5;}}
         /* DSP ABI carries three 17^3 channel planes, not RGB triplets. */
         u16 cube[14739];
         for(u32 i=0;i<4913;i++)for(u32 c=0;c<3;c++)
@@ -247,7 +297,8 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         ar_hal_sys_munmap(p,14739);
         free(dense);dense=(void *)0;
         free(compact);compact=(void *)0;
-        choice=-1;pacing=0;pace_ema_us=0;pace_last_start_us=0;dd_reset();
+        free(tetra);tetra=(void *)0;
+        choice=-1;tuned_c16=tuned_tet=0;pacing=0;pace_ema_us=0;pace_last_start_us=0;dd_reset();
         int rc=0;
         u32 *small=malloc(xreal_compact_table_bytes());
         int crc=small ? 0 : -12;
@@ -259,7 +310,9 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         }
         if(!crc) {
             compact=small;
-            choice=2;
+            u32 *tet=malloc(xreal_tetra_table_bytes());
+            if(tet && !xreal_build_tetra_table(cube,tet)) tetra=tet;
+            else { free(tet); choice=2; }
         } else {
             /* Compact table unavailable: rc7 behaviour with the dense table. */
             free(small);record("perf: compact table unavailable, dense only",crc);
@@ -279,11 +332,14 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         u64 p=*(const u64 *)call->args;
         if(!valid(p,64))return -22;
         record("LUT closing",0);free(dense);dense=(void *)0;
-        free(compact);compact=(void *)0;dd_reset();
-        choice=-1;return result(p,0);
+        free(compact);compact=(void *)0;free(tetra);tetra=(void *)0;dd_reset();
+        choice=-1;
+        int status=result(p,0);
+        mmz_cache_clear();
+        return status;
     }
     if(strcmp(call->name,"ArArmlut3dProcessRgbToYuv"))return xreal_real3d_rpc(core,call,sync);
-    if(call->length!=52 || (choice==0 ? !dense : !compact))return -22;
+    if(call->length!=52 || (choice==0 ? !dense : choice==5 ? !tetra : !compact))return -22;
     const struct frame_args *a=call->args;
     if(!a->width || !a->height || a->width>1920 || a->height>1080 ||
        (a->width&1)||(a->height&1)||(a->strides[0]&1)||!valid(a->result,64))return -22;
@@ -299,8 +355,10 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
     struct timespec before={0,0},converted={0,0},flushed={0,0};
     for(u32 i=0;i<3;i++){planes[i]=map(a->planes[i],sizes[i]);if(!planes[i]){rc=-5;goto done;}}
     mapped_us=now_us();
-    /* compact16 directly (dense only as fallback when compact cannot be built). */
-    int kernel=choice>=0 ? choice : 2;
+    /* perf30: short 6-frame autotune between 8-px NEON compact16 (2) and
+     * 4-px L1-resident NEON tetra (5); loser's table is freed immediately. */
+    if(choice<0 && !tetra)choice=2;
+    int kernel=choice>=0 ? choice : (frame_count%2 ? 5 : 2);
     clock_gettime(1,&before);
     {   long gap=dd_last_call_us ? call_start_us-dd_last_call_us : -1;
         dd_last_call_us=call_start_us;
@@ -317,11 +375,27 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
     if(!served) {
         /* Keep this input as the reference before converting it in place. */
         if(dd_ok){dd_run(planes,a->strides,a->width,a->height,3);dd_prev_valid=1;}
-        rc=rgb_parallel(dense,compact,kernel,planes,a->strides,a->width,a->height);
+        rc=rgb_parallel(dense,compact,tetra,kernel,planes,a->strides,a->width,a->height);
         if(!rc && dd_ok && dd_keep){dd_run(planes,a->strides,a->width,a->height,2);dd_have_copy=1;}
         else{dd_have_copy=0;if(rc)dd_prev_valid=0;}
     }
     clock_gettime(1,&converted);
+    if(!rc && choice<0) {
+        long us=(converted.sec-before.sec)*1000000+(converted.nsec-before.nsec)/1000;
+        u32 u=(u32)(us>0 ? us : 0);
+        if(kernel==2 && tuned_c16<TUNE) tune_c16[tuned_c16++]=u;
+        else if(kernel==5 && tuned_tet<TUNE) tune_tet[tuned_tet++]=u;
+        if(tuned_c16>=TUNE && tuned_tet>=TUNE) {
+            u32 m2=median_u32(tune_c16,TUNE), m5=median_u32(tune_tet,TUNE);
+            choice=m5<m2 ? 5 : 2;
+            if(choice!=5){free(tetra);tetra=(void *)0;}
+            else{free(compact);compact=(void *)0;}
+            char line[200];
+            int n=snprintf(line,sizeof(line),"CPU perf30: autotune compact16_median_us=%u tetra_median_us=%u choice=%s\n",
+                           m2,m5,choice==5 ? "tetra_neon" : "compact16");
+            if(n>0 && n<(int)sizeof(line))aihdr_log(line,(u64)n);
+        }
+    }
     if(!rc && sizes[0]>0x100000) {
         /* Vendor HAL uses a global cache-flush ioctl for sizes above 1 MiB.
          * All three RGB planes have been modified before this call. */
@@ -360,7 +434,7 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         }
     }
 done:
-    for(u32 i=0;i<3;i++)if(planes[i])ar_hal_sys_munmap(planes[i],sizes[i]);
+    if(rc)mmz_cache_clear();
     long unmapped_us=now_us();
     if(!rc && choice>=0) {
         long busy=now_us()-call_start_us;
