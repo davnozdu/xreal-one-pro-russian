@@ -369,8 +369,8 @@ def build(args):
         verification='perf candidate built from rc7; physical mode/performance tests required',
         perf={'base_bin_sha256': RC7_SHA, 'base_release': original['release'],
               'changed_files': [ADAPTER, MANIFEST, CHECKSUMS],
-              'aihdr': 'compact16 (16-bit NEON, 289 KiB table, no autotune); dynamic row scheduling; dense only as fallback; whole-call stage timing',
-              'real3d_proplus': 'vectorized warp, luma bilinear displacement (NEON TBL gather), chroma vertical blend, dynamic row scheduling',
+              'aihdr': 'compact16 (8-pixel 16-bit NEON, precomputed axis weights, 289 KiB table, no autotune); dynamic row scheduling; dense only as fallback; bounded log rotation',
+              'real3d_proplus': 'specialized luma bilinear (8-pixel flat coalescing, NEON TBL gather) and joint U/V NEON paths, no no-op depth copy, global flush, dynamic row scheduling, bounded log rotation',
               'menu_and_osd': 'unchanged rc7 (compare_ui.c and patched libnr_osd.so)',
               'abi': abi_report})
     changed_expected = [ADAPTER, MANIFEST, CHECKSUMS]

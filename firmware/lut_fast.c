@@ -389,6 +389,10 @@ void tetra_pixel(const u32 *table, const u32 *rmap, const u32 *gmap, const u32 *
     *rp = (u8)(rb >> 8); *gp = (u8)(g >> 8); *bp = (u8)(rb >> 24);
 }
 
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+#include <arm_neon.h>
+#endif
+
 int xreal_tetra_rgb_lut(const u32 *table, u8 *r, u8 *g, u8 *b,
                         u32 rs, u32 gs, u32 bs, u32 width, u32 height) {
     if (!table || !r || !g || !b || !width || !height ||
@@ -411,12 +415,93 @@ int xreal_tetra_rgb_lut(const u32 *table, u8 *r, u8 *g, u8 *b,
                 __builtin_memcpy(bp+x, &out_b, 4);
                 continue;
             }
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+            u32 mr[4], mg[4], mb[4];
+            for (u32 lane = 0; lane < 4; ++lane) {
+                mr[lane] = rmap[(kr >> (8 * lane)) & 255];
+                mg[lane] = gmap[(kg >> (8 * lane)) & 255];
+                mb[lane] = bmap[(kb >> (8 * lane)) & 255];
+            }
+            uint32x4_t vmr = vld1q_u32(mr), vmg = vld1q_u32(mg), vmb = vld1q_u32(mb);
+            uint32x4_t vbase = vaddq_u32(vaddq_u32(vshrq_n_u32(vmr, 8), vshrq_n_u32(vmg, 8)), vshrq_n_u32(vmb, 8));
+            uint16x4_t mask8 = vdup_n_u16(255);
+            uint16x4_t f1 = vand_u16(vmovn_u32(vmr), mask8);
+            uint16x4_t f2 = vand_u16(vmovn_u32(vmg), mask8);
+            uint16x4_t f3 = vand_u16(vmovn_u32(vmb), mask8);
+            uint16x4_t s1 = vdup_n_u16(1), s2 = vdup_n_u16(TETRA_G), s3 = vdup_n_u16(TETRA_B);
+            uint16x4_t gt, tf, ts;
+            gt = vcgt_u16(f2, f1);
+            tf = vbsl_u16(gt, f2, f1); f2 = vbsl_u16(gt, f1, f2); f1 = tf;
+            ts = vbsl_u16(gt, s2, s1); s2 = vbsl_u16(gt, s1, s2); s1 = ts;
+            gt = vcgt_u16(f3, f2);
+            tf = vbsl_u16(gt, f3, f2); f3 = vbsl_u16(gt, f2, f3); f2 = tf;
+            ts = vbsl_u16(gt, s3, s2); s3 = vbsl_u16(gt, s2, s3); s2 = ts;
+            gt = vcgt_u16(f2, f1);
+            tf = vbsl_u16(gt, f2, f1); f2 = vbsl_u16(gt, f1, f2); f1 = tf;
+            ts = vbsl_u16(gt, s2, s1); s2 = vbsl_u16(gt, s1, s2); s1 = ts;
+            uint16x4_t w0 = vsub_u16(mask8, f1);
+            uint16x4_t w1 = vsub_u16(f1, f2);
+            uint16x4_t w2 = vsub_u16(f2, f3);
+            uint16x4_t w3 = f3;
+            u32 base[4]; u16 o1[4], o2[4];
+            vst1q_u32(base, vbase);
+            vst1_u16(o1, s1);
+            vst1_u16(o2, vadd_u16(s1, s2));
+            u32 n0[4], na[4], nb[4], n1[4];
+            for (u32 lane = 0; lane < 4; ++lane) {
+                const u32 *e = table + base[lane];
+                n0[lane] = e[0];
+                na[lane] = e[o1[lane]];
+                nb[lane] = e[o2[lane]];
+                n1[lane] = e[1 + TETRA_G + TETRA_B];
+            }
+            uint32x4_t q0 = vld1q_u32(n0), qa = vld1q_u32(na);
+            uint32x4_t qb = vld1q_u32(nb), q1 = vld1q_u32(n1);
+            uint16x4_t c0[3] = {
+                vand_u16(vmovn_u32(q0), mask8),
+                vand_u16(vshrn_n_u32(q0, 8), mask8),
+                vshrn_n_u32(q0, 16)
+            };
+            uint16x4_t ca[3] = {
+                vand_u16(vmovn_u32(qa), mask8),
+                vand_u16(vshrn_n_u32(qa, 8), mask8),
+                vshrn_n_u32(qa, 16)
+            };
+            uint16x4_t cb[3] = {
+                vand_u16(vmovn_u32(qb), mask8),
+                vand_u16(vshrn_n_u32(qb, 8), mask8),
+                vshrn_n_u32(qb, 16)
+            };
+            uint16x4_t c1[3] = {
+                vand_u16(vmovn_u32(q1), mask8),
+                vand_u16(vshrn_n_u32(q1, 8), mask8),
+                vshrn_n_u32(q1, 16)
+            };
+            uint16x4_t half = vdup_n_u16(128);
+            u32 outv[3];
+            for (u32 c = 0; c < 3; ++c) {
+                uint16x4_t acc = vmul_u16(w0, c0[c]);
+                acc = vmla_u16(acc, w1, ca[c]);
+                acc = vmla_u16(acc, w2, cb[c]);
+                acc = vmla_u16(acc, w3, c1[c]);
+                acc = vadd_u16(acc, half);
+                acc = vadd_u16(acc, vshr_n_u16(acc, 8));
+                uint8x8_t o = vshrn_n_u16(vcombine_u16(acc, acc), 8);
+                outv[c] = vget_lane_u32(vreinterpret_u32_u8(o), 0);
+            }
+            out_r = outv[0]; out_g = outv[1]; out_b = outv[2];
+            __builtin_memcpy(rp+x, &out_r, 4);
+            __builtin_memcpy(gp+x, &out_g, 4);
+            __builtin_memcpy(bp+x, &out_b, 4);
+            last_r = kr; last_g = kg; last_b = kb; have_last = 1;
+#else
             for (u32 lane = 0; lane < 4; ++lane)
                 tetra_pixel(table, rmap, gmap, bmap, rp+x+lane, gp+x+lane, bp+x+lane);
             last_r = kr; last_g = kg; last_b = kb; have_last = 1;
             __builtin_memcpy(&out_r, rp+x, 4);
             __builtin_memcpy(&out_g, gp+x, 4);
             __builtin_memcpy(&out_b, bp+x, 4);
+#endif
         }
         for (; x < width; ++x)
             tetra_pixel(table, rmap, gmap, bmap, rp+x, gp+x, bp+x);
@@ -430,10 +515,77 @@ int xreal_tetra_rgb_lut(const u32 *table, u8 *r, u8 *g, u8 *b,
  * B rows, then the B lerp. Lerp: a + round((b-a)*w/32768) (SQRDMULH) with
  * w = (f*32897+64)>>8 ~ f*32768/255 (f=255 -> 32767). Error versus the cube: Q2 table
  * <= 1/8 level, each lerp <= 1/8, final rounding 1/2: within 1 level.
- * The portable path computes exactly the same lanes. */
-#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
-#include <arm_neon.h>
-#endif
+ * The portable path computes exactly the same lanes.
+ * Precomputed axis maps pack (table_offset << 16) | c16_weight(f) so the hot
+ * loop computes zero weight arithmetic. */
+static const u32 C16_GMAP[256] = {
+    0x00000000U, 0x00000808U, 0x00001010U, 0x00001818U, 0x00002020U, 0x00002828U, 0x00003030U, 0x00003838U,
+    0x00004040U, 0x00004848U, 0x00005050U, 0x00005858U, 0x00006061U, 0x00006869U, 0x00007071U, 0x00007879U,
+    0x01000080U, 0x01000888U, 0x01001090U, 0x01001898U, 0x010020a1U, 0x010028a9U, 0x010030b1U, 0x010038b9U,
+    0x010040c1U, 0x010048c9U, 0x010050d1U, 0x010058d9U, 0x010060e1U, 0x010068e9U, 0x010070f1U, 0x010078f9U,
+    0x02000101U, 0x02000909U, 0x02001111U, 0x02001919U, 0x02002121U, 0x02002929U, 0x02003131U, 0x02003939U,
+    0x02004141U, 0x02004949U, 0x02005151U, 0x02005959U, 0x02006162U, 0x0200696aU, 0x02007172U, 0x0200797aU,
+    0x03000181U, 0x03000989U, 0x03001191U, 0x03001999U, 0x030021a2U, 0x030029aaU, 0x030031b2U, 0x030039baU,
+    0x030041c2U, 0x030049caU, 0x030051d2U, 0x030059daU, 0x030061e2U, 0x030069eaU, 0x030071f2U, 0x030079faU,
+    0x04000202U, 0x04000a0aU, 0x04001212U, 0x04001a1aU, 0x04002222U, 0x04002a2aU, 0x04003232U, 0x04003a3aU,
+    0x04004242U, 0x04004a4aU, 0x04005252U, 0x04005a5aU, 0x04006263U, 0x04006a6bU, 0x04007273U, 0x04007a7bU,
+    0x05000282U, 0x05000a8aU, 0x05001292U, 0x05001a9aU, 0x050022a3U, 0x05002aabU, 0x050032b3U, 0x05003abbU,
+    0x050042c3U, 0x05004acbU, 0x050052d3U, 0x05005adbU, 0x050062e3U, 0x05006aebU, 0x050072f3U, 0x05007afbU,
+    0x06000303U, 0x06000b0bU, 0x06001313U, 0x06001b1bU, 0x06002323U, 0x06002b2bU, 0x06003333U, 0x06003b3bU,
+    0x06004343U, 0x06004b4bU, 0x06005353U, 0x06005b5bU, 0x06006364U, 0x06006b6cU, 0x06007374U, 0x06007b7cU,
+    0x07000383U, 0x07000b8bU, 0x07001393U, 0x07001b9bU, 0x070023a4U, 0x07002bacU, 0x070033b4U, 0x07003bbcU,
+    0x070043c4U, 0x07004bccU, 0x070053d4U, 0x07005bdcU, 0x070063e4U, 0x07006becU, 0x070073f4U, 0x07007bfcU,
+    0x08000404U, 0x08000c0cU, 0x08001414U, 0x08001c1cU, 0x08002424U, 0x08002c2cU, 0x08003434U, 0x08003c3cU,
+    0x08004444U, 0x08004c4cU, 0x08005454U, 0x08005c5cU, 0x08006465U, 0x08006c6dU, 0x08007475U, 0x08007c7dU,
+    0x09000484U, 0x09000c8cU, 0x09001494U, 0x09001c9cU, 0x090024a5U, 0x09002cadU, 0x090034b5U, 0x09003cbdU,
+    0x090044c5U, 0x09004ccdU, 0x090054d5U, 0x09005cddU, 0x090064e5U, 0x09006cedU, 0x090074f5U, 0x09007cfdU,
+    0x0a000505U, 0x0a000d0dU, 0x0a001515U, 0x0a001d1dU, 0x0a002525U, 0x0a002d2dU, 0x0a003535U, 0x0a003d3dU,
+    0x0a004545U, 0x0a004d4dU, 0x0a005555U, 0x0a005d5dU, 0x0a006566U, 0x0a006d6eU, 0x0a007576U, 0x0a007d7eU,
+    0x0b000585U, 0x0b000d8dU, 0x0b001595U, 0x0b001d9dU, 0x0b0025a6U, 0x0b002daeU, 0x0b0035b6U, 0x0b003dbeU,
+    0x0b0045c6U, 0x0b004dceU, 0x0b0055d6U, 0x0b005ddeU, 0x0b0065e6U, 0x0b006deeU, 0x0b0075f6U, 0x0b007dfeU,
+    0x0c000606U, 0x0c000e0eU, 0x0c001616U, 0x0c001e1eU, 0x0c002626U, 0x0c002e2eU, 0x0c003636U, 0x0c003e3eU,
+    0x0c004646U, 0x0c004e4eU, 0x0c005656U, 0x0c005e5eU, 0x0c006667U, 0x0c006e6fU, 0x0c007677U, 0x0c007e7fU,
+    0x0d000686U, 0x0d000e8eU, 0x0d001696U, 0x0d001e9eU, 0x0d0026a7U, 0x0d002eafU, 0x0d0036b7U, 0x0d003ebfU,
+    0x0d0046c7U, 0x0d004ecfU, 0x0d0056d7U, 0x0d005edfU, 0x0d0066e7U, 0x0d006eefU, 0x0d0076f7U, 0x0d007effU,
+    0x0e000707U, 0x0e000f0fU, 0x0e001717U, 0x0e001f1fU, 0x0e002727U, 0x0e002f2fU, 0x0e003737U, 0x0e003f3fU,
+    0x0e004747U, 0x0e004f4fU, 0x0e005757U, 0x0e005f5fU, 0x0e006768U, 0x0e006f70U, 0x0e007778U, 0x0e007f80U,
+    0x0f000787U, 0x0f000f8fU, 0x0f001797U, 0x0f001f9fU, 0x0f0027a8U, 0x0f002fb0U, 0x0f0037b8U, 0x0f003fc0U,
+    0x0f0047c8U, 0x0f004fd0U, 0x0f0057d8U, 0x0f005fe0U, 0x0f0067e8U, 0x0f006ff0U, 0x0f0077f8U, 0x0f007fffU
+};
+static const u32 C16_BMAP[256] = {
+    0x00000000U, 0x00000808U, 0x00001010U, 0x00001818U, 0x00002020U, 0x00002828U, 0x00003030U, 0x00003838U,
+    0x00004040U, 0x00004848U, 0x00005050U, 0x00005858U, 0x00006061U, 0x00006869U, 0x00007071U, 0x00007879U,
+    0x11000080U, 0x11000888U, 0x11001090U, 0x11001898U, 0x110020a1U, 0x110028a9U, 0x110030b1U, 0x110038b9U,
+    0x110040c1U, 0x110048c9U, 0x110050d1U, 0x110058d9U, 0x110060e1U, 0x110068e9U, 0x110070f1U, 0x110078f9U,
+    0x22000101U, 0x22000909U, 0x22001111U, 0x22001919U, 0x22002121U, 0x22002929U, 0x22003131U, 0x22003939U,
+    0x22004141U, 0x22004949U, 0x22005151U, 0x22005959U, 0x22006162U, 0x2200696aU, 0x22007172U, 0x2200797aU,
+    0x33000181U, 0x33000989U, 0x33001191U, 0x33001999U, 0x330021a2U, 0x330029aaU, 0x330031b2U, 0x330039baU,
+    0x330041c2U, 0x330049caU, 0x330051d2U, 0x330059daU, 0x330061e2U, 0x330069eaU, 0x330071f2U, 0x330079faU,
+    0x44000202U, 0x44000a0aU, 0x44001212U, 0x44001a1aU, 0x44002222U, 0x44002a2aU, 0x44003232U, 0x44003a3aU,
+    0x44004242U, 0x44004a4aU, 0x44005252U, 0x44005a5aU, 0x44006263U, 0x44006a6bU, 0x44007273U, 0x44007a7bU,
+    0x55000282U, 0x55000a8aU, 0x55001292U, 0x55001a9aU, 0x550022a3U, 0x55002aabU, 0x550032b3U, 0x55003abbU,
+    0x550042c3U, 0x55004acbU, 0x550052d3U, 0x55005adbU, 0x550062e3U, 0x55006aebU, 0x550072f3U, 0x55007afbU,
+    0x66000303U, 0x66000b0bU, 0x66001313U, 0x66001b1bU, 0x66002323U, 0x66002b2bU, 0x66003333U, 0x66003b3bU,
+    0x66004343U, 0x66004b4bU, 0x66005353U, 0x66005b5bU, 0x66006364U, 0x66006b6cU, 0x66007374U, 0x66007b7cU,
+    0x77000383U, 0x77000b8bU, 0x77001393U, 0x77001b9bU, 0x770023a4U, 0x77002bacU, 0x770033b4U, 0x77003bbcU,
+    0x770043c4U, 0x77004bccU, 0x770053d4U, 0x77005bdcU, 0x770063e4U, 0x77006becU, 0x770073f4U, 0x77007bfcU,
+    0x88000404U, 0x88000c0cU, 0x88001414U, 0x88001c1cU, 0x88002424U, 0x88002c2cU, 0x88003434U, 0x88003c3cU,
+    0x88004444U, 0x88004c4cU, 0x88005454U, 0x88005c5cU, 0x88006465U, 0x88006c6dU, 0x88007475U, 0x88007c7dU,
+    0x99000484U, 0x99000c8cU, 0x99001494U, 0x99001c9cU, 0x990024a5U, 0x99002cadU, 0x990034b5U, 0x99003cbdU,
+    0x990044c5U, 0x99004ccdU, 0x990054d5U, 0x99005cddU, 0x990064e5U, 0x99006cedU, 0x990074f5U, 0x99007cfdU,
+    0xaa000505U, 0xaa000d0dU, 0xaa001515U, 0xaa001d1dU, 0xaa002525U, 0xaa002d2dU, 0xaa003535U, 0xaa003d3dU,
+    0xaa004545U, 0xaa004d4dU, 0xaa005555U, 0xaa005d5dU, 0xaa006566U, 0xaa006d6eU, 0xaa007576U, 0xaa007d7eU,
+    0xbb000585U, 0xbb000d8dU, 0xbb001595U, 0xbb001d9dU, 0xbb0025a6U, 0xbb002daeU, 0xbb0035b6U, 0xbb003dbeU,
+    0xbb0045c6U, 0xbb004dceU, 0xbb0055d6U, 0xbb005ddeU, 0xbb0065e6U, 0xbb006deeU, 0xbb0075f6U, 0xbb007dfeU,
+    0xcc000606U, 0xcc000e0eU, 0xcc001616U, 0xcc001e1eU, 0xcc002626U, 0xcc002e2eU, 0xcc003636U, 0xcc003e3eU,
+    0xcc004646U, 0xcc004e4eU, 0xcc005656U, 0xcc005e5eU, 0xcc006667U, 0xcc006e6fU, 0xcc007677U, 0xcc007e7fU,
+    0xdd000686U, 0xdd000e8eU, 0xdd001696U, 0xdd001e9eU, 0xdd0026a7U, 0xdd002eafU, 0xdd0036b7U, 0xdd003ebfU,
+    0xdd0046c7U, 0xdd004ecfU, 0xdd0056d7U, 0xdd005edfU, 0xdd0066e7U, 0xdd006eefU, 0xdd0076f7U, 0xdd007effU,
+    0xee000707U, 0xee000f0fU, 0xee001717U, 0xee001f1fU, 0xee002727U, 0xee002f2fU, 0xee003737U, 0xee003f3fU,
+    0xee004747U, 0xee004f4fU, 0xee005757U, 0xee005f5fU, 0xee006768U, 0xee006f70U, 0xee007778U, 0xee007f80U,
+    0xff000787U, 0xff000f8fU, 0xff001797U, 0xff001f9fU, 0xff0027a8U, 0xff002fb0U, 0xff0037b8U, 0xff003fc0U,
+    0xff0047c8U, 0xff004fd0U, 0xff0057d8U, 0xff005fe0U, 0xff0067e8U, 0xff006ff0U, 0xff0077f8U, 0xff007fffU
+};
 
 static inline short c16_mulh(short a, short w) {  /* SQRDMULH, no saturation case */
     return (short)(((int)a * w * 2 + 0x8000) >> 16);
@@ -452,17 +604,122 @@ static inline u8 c16_channel(u32 p00, u32 p01, u32 p10, u32 p11, u32 shift, shor
     return (u8)(out > 255 ? 255 : out);
 }
 
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+static inline __attribute__((always_inline))
+void c16_gather4_neon(const u32 *table, u32 kr, u32 kg, u32 kb,
+                      uint32x4_t *q00, uint32x4_t *q01, uint32x4_t *q10, uint32x4_t *q11,
+                      int16x4_t *vwg, int16x4_t *vwb) {
+    u32 c00[4], c01[4], c10[4], c11[4];
+    u16 wg[4], wb[4];
+    for (u32 lane = 0; lane < 4; ++lane) {
+        u32 gm = C16_GMAP[(kg >> (8 * lane)) & 255];
+        u32 bm = C16_BMAP[(kb >> (8 * lane)) & 255];
+        const u32 *e = table + (gm >> 16) + (bm >> 16) + ((kr >> (8 * lane)) & 255);
+        c00[lane] = e[0];
+        c01[lane] = e[COMPACT_G_STEP];
+        c10[lane] = e[COMPACT_B_STEP];
+        c11[lane] = e[COMPACT_B_STEP + COMPACT_G_STEP];
+        wg[lane] = (u16)gm;
+        wb[lane] = (u16)bm;
+    }
+    *q00 = vld1q_u32(c00); *q01 = vld1q_u32(c01);
+    *q10 = vld1q_u32(c10); *q11 = vld1q_u32(c11);
+    *vwg = vreinterpret_s16_u16(vld1_u16(wg));
+    *vwb = vreinterpret_s16_u16(vld1_u16(wb));
+}
+
+static inline __attribute__((always_inline))
+void c16_glerp4_neon(uint32x4_t q00, uint32x4_t q01, uint32x4_t q10, uint32x4_t q11,
+                     int16x4_t vwg, int16x8_t gl[3]) {
+    int16x8_t wg8 = vcombine_s16(vwg, vwg);
+    uint16x8_t mask = vdupq_n_u16(1023);
+    uint16x8_t los[3] = {
+        vandq_u16(vcombine_u16(vmovn_u32(q00), vmovn_u32(q10)), mask),
+        vandq_u16(vcombine_u16(vshrn_n_u32(q00, 10), vshrn_n_u32(q10, 10)), mask),
+        vshrq_n_u16(vcombine_u16(vshrn_n_u32(q00, 16), vshrn_n_u32(q10, 16)), 4)
+    };
+    uint16x8_t his[3] = {
+        vandq_u16(vcombine_u16(vmovn_u32(q01), vmovn_u32(q11)), mask),
+        vandq_u16(vcombine_u16(vshrn_n_u32(q01, 10), vshrn_n_u32(q11, 10)), mask),
+        vshrq_n_u16(vcombine_u16(vshrn_n_u32(q01, 16), vshrn_n_u32(q11, 16)), 4)
+    };
+    for (u32 c = 0; c < 3; ++c) {
+        int16x8_t lo = vreinterpretq_s16_u16(los[c]);
+        int16x8_t hi = vreinterpretq_s16_u16(his[c]);
+        gl[c] = vaddq_s16(lo, vqrdmulhq_s16(vsubq_s16(hi, lo), wg8));
+    }
+}
+#endif
+
 int xreal_compact16_rgb_lut(const u32 *table, u8 *r, u8 *g, u8 *b,
                             u32 rs, u32 gs, u32 bs, u32 width, u32 height) {
     if (!table || !r || !g || !b || !width || !height ||
         width>1920 || height>1080 || rs<width || gs<width || bs<width ||
         rs>4096 || gs>4096 || bs>4096) return -22;
-    const u32 *gmap = table + COMPACT_WORDS, *bmap = gmap + 256;
     for (u32 y = 0; y < height; ++y) {
         u8 *rp = r+(u64)y*rs, *gp = g+(u64)y*gs, *bp = b+(u64)y*bs;
+        u32 x = 0;
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+        u64 last_r = 0, last_g = 0, last_b = 0, out_r = 0, out_g = 0, out_b = 0;
+        int have_last = 0;
+        for (; x+8 <= width; x += 8) {
+            u64 kr, kg, kb;
+            __builtin_memcpy(&kr, rp+x, 8);
+            __builtin_memcpy(&kg, gp+x, 8);
+            __builtin_memcpy(&kb, bp+x, 8);
+            if (have_last && kr == last_r && kg == last_g && kb == last_b) {
+                __builtin_memcpy(rp+x, &out_r, 8);
+                __builtin_memcpy(gp+x, &out_g, 8);
+                __builtin_memcpy(bp+x, &out_b, 8);
+                continue;
+            }
+            uint32x4_t a00, a01, a10, a11, b00, b01, b10, b11;
+            int16x4_t awg, awb, bwg, bwb;
+            c16_gather4_neon(table, (u32)kr, (u32)kg, (u32)kb, &a00, &a01, &a10, &a11, &awg, &awb);
+            c16_gather4_neon(table, (u32)(kr >> 32), (u32)(kg >> 32), (u32)(kb >> 32),
+                             &b00, &b01, &b10, &b11, &bwg, &bwb);
+            int16x8_t gla[3], glb[3];
+            c16_glerp4_neon(a00, a01, a10, a11, awg, gla);
+            c16_glerp4_neon(b00, b01, b10, b11, bwg, glb);
+            int16x8_t wb8 = vcombine_s16(awb, bwb);
+            uint8x8_t res[3];
+            for (u32 c = 0; c < 3; ++c) {
+                int16x8_t g0 = vcombine_s16(vget_low_s16(gla[c]), vget_low_s16(glb[c]));
+                int16x8_t g1 = vcombine_s16(vget_high_s16(gla[c]), vget_high_s16(glb[c]));
+                int16x8_t v = vaddq_s16(g0, vqrdmulhq_s16(vsubq_s16(g1, g0), wb8));
+                uint16x8_t o = vrshrq_n_u16(vreinterpretq_u16_s16(v), 2);
+                res[c] = vqmovn_u16(o);
+            }
+            vst1_u8(rp+x, res[0]);
+            vst1_u8(gp+x, res[1]);
+            vst1_u8(bp+x, res[2]);
+            last_r = kr; last_g = kg; last_b = kb; have_last = 1;
+            out_r = vget_lane_u64(vreinterpret_u64_u8(res[0]), 0);
+            out_g = vget_lane_u64(vreinterpret_u64_u8(res[1]), 0);
+            out_b = vget_lane_u64(vreinterpret_u64_u8(res[2]), 0);
+        }
+        if (x+4 <= width) {
+            u32 kr, kg, kb;
+            __builtin_memcpy(&kr, rp+x, 4);
+            __builtin_memcpy(&kg, gp+x, 4);
+            __builtin_memcpy(&kb, bp+x, 4);
+            uint32x4_t q00, q01, q10, q11;
+            int16x4_t vwg, vwb;
+            c16_gather4_neon(table, kr, kg, kb, &q00, &q01, &q10, &q11, &vwg, &vwb);
+            int16x8_t gl[3];
+            c16_glerp4_neon(q00, q01, q10, q11, vwg, gl);
+            u8 *dst[3] = {rp+x, gp+x, bp+x};
+            for (u32 c = 0; c < 3; ++c) {
+                int16x4_t g0 = vget_low_s16(gl[c]), g1 = vget_high_s16(gl[c]);
+                int16x4_t v = vadd_s16(g0, vqrdmulh_s16(vsub_s16(g1, g0), vwb));
+                uint16x4_t o = vrshr_n_u16(vreinterpret_u16_s16(v), 2);
+                vst1_lane_u32((uint32_t *)(void *)dst[c], vreinterpret_u32_u8(vqmovn_u16(vcombine_u16(o, o))), 0);
+            }
+            x += 4;
+        }
+#else
         u32 last_r = 0, last_g = 0, last_b = 0, out_r = 0, out_g = 0, out_b = 0;
         int have_last = 0;
-        u32 x = 0;
         for (; x+4 <= width; x += 4) {
             u32 kr, kg, kb;
             __builtin_memcpy(&kr, rp+x, 4);
@@ -474,66 +731,28 @@ int xreal_compact16_rgb_lut(const u32 *table, u8 *r, u8 *g, u8 *b,
                 __builtin_memcpy(bp+x, &out_b, 4);
                 continue;
             }
-            u32 c00[4], c01[4], c10[4], c11[4];
-            unsigned short wg[4], wb[4];
             for (u32 lane = 0; lane < 4; ++lane) {
-                u32 gm = gmap[gp[x+lane]], bm = bmap[bp[x+lane]];
-                u32 index = (gm >> 8) + (bm >> 8) + rp[x+lane];
-                c00[lane] = table[index];
-                c01[lane] = table[index+COMPACT_G_STEP];
-                c10[lane] = table[index+COMPACT_B_STEP];
-                c11[lane] = table[index+COMPACT_B_STEP+COMPACT_G_STEP];
-                wg[lane] = (unsigned short)c16_weight(gm & 255);
-                wb[lane] = (unsigned short)c16_weight(bm & 255);
+                u32 gm = C16_GMAP[(kg >> (8 * lane)) & 255];
+                u32 bm = C16_BMAP[(kb >> (8 * lane)) & 255];
+                const u32 *e = table + (gm >> 16) + (bm >> 16) + ((kr >> (8 * lane)) & 255);
+                short wg = (short)(u16)gm, wb = (short)(u16)bm;
+                rp[x+lane] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 0, wg, wb);
+                gp[x+lane] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 10, wg, wb);
+                bp[x+lane] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 20, wg, wb);
             }
-#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
-            uint32x4_t q00 = vld1q_u32(c00), q01 = vld1q_u32(c01);
-            uint32x4_t q10 = vld1q_u32(c10), q11 = vld1q_u32(c11);
-            int16x4_t vwg = vreinterpret_s16_u16(vld1_u16(wg));
-            int16x4_t vwb = vreinterpret_s16_u16(vld1_u16(wb));
-            int16x8_t wg8 = vcombine_s16(vwg, vwg);
-            uint16x8_t mask = vdupq_n_u16(1023);
-            /* lo = [p00 | p10], hi = [p01 | p11] for each channel. */
-            uint16x8_t lo_r = vandq_u16(vcombine_u16(vmovn_u32(q00), vmovn_u32(q10)), mask);
-            uint16x8_t hi_r = vandq_u16(vcombine_u16(vmovn_u32(q01), vmovn_u32(q11)), mask);
-            uint16x8_t lo_g = vandq_u16(vcombine_u16(vshrn_n_u32(q00, 10), vshrn_n_u32(q10, 10)), mask);
-            uint16x8_t hi_g = vandq_u16(vcombine_u16(vshrn_n_u32(q01, 10), vshrn_n_u32(q11, 10)), mask);
-            uint16x8_t lo_b = vshrq_n_u16(vcombine_u16(vshrn_n_u32(q00, 16), vshrn_n_u32(q10, 16)), 4);
-            uint16x8_t hi_b = vshrq_n_u16(vcombine_u16(vshrn_n_u32(q01, 16), vshrn_n_u32(q11, 16)), 4);
-            uint8x8_t res[3];
-            uint16x8_t los[3] = {lo_r, lo_g, lo_b}, his[3] = {hi_r, hi_g, hi_b};
-            for (u32 c = 0; c < 3; ++c) {
-                int16x8_t lo = vreinterpretq_s16_u16(los[c]), hi = vreinterpretq_s16_u16(his[c]);
-                int16x8_t gl = vaddq_s16(lo, vqrdmulhq_s16(vsubq_s16(hi, lo), wg8));
-                int16x4_t g0 = vget_low_s16(gl), g1 = vget_high_s16(gl);
-                int16x4_t v = vadd_s16(g0, vqrdmulh_s16(vsub_s16(g1, g0), vwb));
-                uint16x4_t o = vrshr_n_u16(vreinterpret_u16_s16(v), 2);
-                res[c] = vqmovn_u16(vcombine_u16(o, o));
-            }
-            vst1_lane_u32((uint32_t *)(void *)(rp+x), vreinterpret_u32_u8(res[0]), 0);
-            vst1_lane_u32((uint32_t *)(void *)(gp+x), vreinterpret_u32_u8(res[1]), 0);
-            vst1_lane_u32((uint32_t *)(void *)(bp+x), vreinterpret_u32_u8(res[2]), 0);
-#else
-            for (u32 lane = 0; lane < 4; ++lane) {
-                rp[x+lane] = c16_channel(c00[lane], c01[lane], c10[lane], c11[lane], 0, (short)wg[lane], (short)wb[lane]);
-                gp[x+lane] = c16_channel(c00[lane], c01[lane], c10[lane], c11[lane], 10, (short)wg[lane], (short)wb[lane]);
-                bp[x+lane] = c16_channel(c00[lane], c01[lane], c10[lane], c11[lane], 20, (short)wg[lane], (short)wb[lane]);
-            }
-#endif
             last_r = kr; last_g = kg; last_b = kb; have_last = 1;
             __builtin_memcpy(&out_r, rp+x, 4);
             __builtin_memcpy(&out_g, gp+x, 4);
             __builtin_memcpy(&out_b, bp+x, 4);
         }
+#endif
         for (; x < width; ++x) {
-            u32 gm = gmap[gp[x]], bm = bmap[bp[x]];
-            u32 index = (gm >> 8) + (bm >> 8) + rp[x];
-            u32 p00 = table[index], p01 = table[index+COMPACT_G_STEP];
-            u32 p10 = table[index+COMPACT_B_STEP], p11 = table[index+COMPACT_B_STEP+COMPACT_G_STEP];
-            short wg = (short)c16_weight(gm & 255), wb = (short)c16_weight(bm & 255);
-            rp[x] = c16_channel(p00, p01, p10, p11, 0, wg, wb);
-            gp[x] = c16_channel(p00, p01, p10, p11, 10, wg, wb);
-            bp[x] = c16_channel(p00, p01, p10, p11, 20, wg, wb);
+            u32 gm = C16_GMAP[gp[x]], bm = C16_BMAP[bp[x]];
+            const u32 *e = table + (gm >> 16) + (bm >> 16) + rp[x];
+            short wg = (short)(u16)gm, wb = (short)(u16)bm;
+            rp[x] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 0, wg, wb);
+            gp[x] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 10, wg, wb);
+            bp[x] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 20, wg, wb);
         }
     }
     return 0;
@@ -559,61 +778,45 @@ void xreal_blocks_take_counts(unsigned long long *smooth, unsigned long long *ti
 
 static inline void c16_group4(const u32 *table, const u32 *gmap, const u32 *bmap,
                               u8 *rp, u8 *gp, u8 *bp) {
-    u32 c00[4], c01[4], c10[4], c11[4];
-    unsigned short wg[4], wb[4];
-    for (u32 lane = 0; lane < 4; ++lane) {
-        u32 gm = gmap[gp[lane]], bm = bmap[bp[lane]];
-        u32 index = (gm >> 8) + (bm >> 8) + rp[lane];
-        c00[lane] = table[index];
-        c01[lane] = table[index+COMPACT_G_STEP];
-        c10[lane] = table[index+COMPACT_B_STEP];
-        c11[lane] = table[index+COMPACT_B_STEP+COMPACT_G_STEP];
-        wg[lane] = (unsigned short)c16_weight(gm & 255);
-        wb[lane] = (unsigned short)c16_weight(bm & 255);
-    }
+    (void)gmap; (void)bmap;
 #if defined(__aarch64__) && !defined(XREAL_NO_NEON)
-    uint32x4_t q00 = vld1q_u32(c00), q01 = vld1q_u32(c01);
-    uint32x4_t q10 = vld1q_u32(c10), q11 = vld1q_u32(c11);
-    int16x4_t vwg = vreinterpret_s16_u16(vld1_u16(wg));
-    int16x4_t vwb = vreinterpret_s16_u16(vld1_u16(wb));
-    int16x8_t wg8 = vcombine_s16(vwg, vwg);
-    uint16x8_t mask = vdupq_n_u16(1023);
-    uint16x8_t los[3] = {
-        vandq_u16(vcombine_u16(vmovn_u32(q00), vmovn_u32(q10)), mask),
-        vandq_u16(vcombine_u16(vshrn_n_u32(q00, 10), vshrn_n_u32(q10, 10)), mask),
-        vshrq_n_u16(vcombine_u16(vshrn_n_u32(q00, 16), vshrn_n_u32(q10, 16)), 4)};
-    uint16x8_t his[3] = {
-        vandq_u16(vcombine_u16(vmovn_u32(q01), vmovn_u32(q11)), mask),
-        vandq_u16(vcombine_u16(vshrn_n_u32(q01, 10), vshrn_n_u32(q11, 10)), mask),
-        vshrq_n_u16(vcombine_u16(vshrn_n_u32(q01, 16), vshrn_n_u32(q11, 16)), 4)};
+    u32 kr, kg, kb;
+    __builtin_memcpy(&kr, rp, 4);
+    __builtin_memcpy(&kg, gp, 4);
+    __builtin_memcpy(&kb, bp, 4);
+    uint32x4_t q00, q01, q10, q11;
+    int16x4_t vwg, vwb;
+    c16_gather4_neon(table, kr, kg, kb, &q00, &q01, &q10, &q11, &vwg, &vwb);
+    int16x8_t gl[3];
+    c16_glerp4_neon(q00, q01, q10, q11, vwg, gl);
     u8 *dst[3] = {rp, gp, bp};
     for (u32 c = 0; c < 3; ++c) {
-        int16x8_t lo = vreinterpretq_s16_u16(los[c]), hi = vreinterpretq_s16_u16(his[c]);
-        int16x8_t gl = vaddq_s16(lo, vqrdmulhq_s16(vsubq_s16(hi, lo), wg8));
-        int16x4_t g0 = vget_low_s16(gl), g1 = vget_high_s16(gl);
+        int16x4_t g0 = vget_low_s16(gl[c]), g1 = vget_high_s16(gl[c]);
         int16x4_t v = vadd_s16(g0, vqrdmulh_s16(vsub_s16(g1, g0), vwb));
         uint16x4_t o = vrshr_n_u16(vreinterpret_u16_s16(v), 2);
         vst1_lane_u32((uint32_t *)(void *)dst[c], vreinterpret_u32_u8(vqmovn_u16(vcombine_u16(o, o))), 0);
     }
 #else
     for (u32 lane = 0; lane < 4; ++lane) {
-        rp[lane] = c16_channel(c00[lane], c01[lane], c10[lane], c11[lane], 0, (short)wg[lane], (short)wb[lane]);
-        gp[lane] = c16_channel(c00[lane], c01[lane], c10[lane], c11[lane], 10, (short)wg[lane], (short)wb[lane]);
-        bp[lane] = c16_channel(c00[lane], c01[lane], c10[lane], c11[lane], 20, (short)wg[lane], (short)wb[lane]);
+        u32 gm = C16_GMAP[gp[lane]], bm = C16_BMAP[bp[lane]];
+        const u32 *e = table + (gm >> 16) + (bm >> 16) + rp[lane];
+        short wg = (short)(u16)gm, wb = (short)(u16)bm;
+        rp[lane] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 0, wg, wb);
+        gp[lane] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 10, wg, wb);
+        bp[lane] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 20, wg, wb);
     }
 #endif
 }
 
 static inline void c16_pixel(const u32 *table, const u32 *gmap, const u32 *bmap,
                              u32 r, u32 g, u32 b, int out[3]) {
-    u32 gm = gmap[g], bm = bmap[b];
-    u32 index = (gm >> 8) + (bm >> 8) + r;
-    u32 p00 = table[index], p01 = table[index+COMPACT_G_STEP];
-    u32 p10 = table[index+COMPACT_B_STEP], p11 = table[index+COMPACT_B_STEP+COMPACT_G_STEP];
-    short wg = (short)c16_weight(gm & 255), wb = (short)c16_weight(bm & 255);
-    out[0] = c16_channel(p00, p01, p10, p11, 0, wg, wb);
-    out[1] = c16_channel(p00, p01, p10, p11, 10, wg, wb);
-    out[2] = c16_channel(p00, p01, p10, p11, 20, wg, wb);
+    (void)gmap; (void)bmap;
+    u32 gm = C16_GMAP[g], bm = C16_BMAP[b];
+    const u32 *e = table + (gm >> 16) + (bm >> 16) + r;
+    short wg = (short)(u16)gm, wb = (short)(u16)bm;
+    out[0] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 0, wg, wb);
+    out[1] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 10, wg, wb);
+    out[2] = c16_channel(e[0], e[COMPACT_G_STEP], e[COMPACT_B_STEP], e[COMPACT_B_STEP+COMPACT_G_STEP], 20, wg, wb);
 }
 
 static inline int block_smooth(u32 a, u32 b, u32 c, u32 d) {
