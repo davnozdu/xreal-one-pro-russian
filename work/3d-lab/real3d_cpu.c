@@ -19,6 +19,7 @@ extern int strcmp(const char *, const char *);
 extern int snprintf(char *, size_t, const char *, ...);
 extern int open(const char *, int, ...);
 extern long write(int, const void *, size_t);
+extern long pwrite(int, const void *, size_t, long);
 extern int close(int);
 extern int rename(const char *, const char *);
 extern int pthread_create(u64 *, const void *, void *(*)(void *), void *);
