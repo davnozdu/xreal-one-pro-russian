@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / 'installer'))
 from package_format import container_crc, read_container
 from profiles import ABI_LIBRARIES, MMZ_START, MMZ_END, SOC
 from version import VERSION
+import jsonc
 
 PILOT = '2.0.0.20260920102250'
 BASE_SHA = '1b72fc6acd90fc9b8995644cca659907d571292f19a19a33cdbddd59da5decd0'
@@ -24,7 +25,8 @@ SOURCES = ['firmware/cpu_adapter.c', 'firmware/lut_fast.c', 'firmware/runtime.c'
            'firmware/runtime.h', 'work/3d-lab/real3d_cpu.c', 'firmware/build.py',
            'installer/profiles.py', 'installer/package_format.py', 'installer/version.py',
            'firmware/compare_ui.c', 'firmware/ui_dispatch.S', 'firmware/generate_compare_ui.py',
-           'firmware/ui_fast.py', 'firmware/onepro_warp.c', 'firmware/onepro_warp.h', 'firmware/compare_modes.py']
+           'firmware/ui_fast.py', 'firmware/onepro_warp.c', 'firmware/onepro_warp.h', 'firmware/compare_modes.py',
+           'firmware/jsonc.py']
 
 
 def sha(data):
@@ -39,7 +41,29 @@ def checked(path, expected):
 
 
 def config(data):
-    return json.loads(re.sub(r'//[^\n]*', '', data.decode('utf-8')))
+    return jsonc.loads(data)
+
+
+# Same base BIN (BASE_SHA): 90 Hz default display mode, 60 Hz synthetic stereo.
+DISPLAY_DEFAULTS = (
+    (('state_machine', 'space_screen', 'frame_rate_boost_enable'), False),
+    (('state_machine', 'space_screen', 'over_clocking_mode'), 0),
+    (('display', 'dp', 'synth_stereo'), '1920_1080_60'),
+    (('display', 'dp', 'mono'), '1920_1080_90_DEFAULT'),
+    (('display', 'oled', 'default_resolution'), '1920_1080_90'),
+)
+
+
+def check_display_defaults(general):
+    """Raise ValueError unless the general config keeps vendor display modes; never modifies it."""
+    for keys, expected in DISPLAY_DEFAULTS:
+        value = general
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                raise ValueError('Missing display setting: '+'.'.join(keys))
+            value = value[key]
+        if type(value) is not type(expected) or value != expected:
+            raise ValueError(f'Unexpected display setting {".".join(keys)}={value!r}; expected {expected!r}')
 
 
 def encode(value):
@@ -84,6 +108,11 @@ def build(args):
         flags.append('-DXREAL_COMPARE_ONEPRO_WARP=1')
     if getattr(args, 'ui_fast', False):
         flags.append('-DXREAL_UI_FAST=1')
+    sample_frames = getattr(args, 'hdr_sample_frames', None)
+    if sample_frames is not None:
+        if not 1 <= sample_frames <= 100000:
+            raise ValueError('--hdr-sample-frames must be between 1 and 100000')
+        flags.append(f'-DXREAL_HDR_SAMPLE_FRAMES={sample_frames}')
     subprocess.run([str(args.clang), *flags, *[s for s in SOURCES if s.endswith(('.c', '.S'))], *generated,
                     '-L', str(args.sysroot.resolve()),
                     *['-l:'+n for n in link_names], '-o', str(library)],
@@ -101,9 +130,11 @@ def build(args):
         contents = {i.filename: z.read(i) for i in z.infolist()}
         attrs = {i.filename: copy.copy(i) for i in z.infolist()}
     results = {}
-    if args.model == 'one' and args.compare_onepro_warp:
-        raise ValueError('One Pro mesh is not supported on One')
-    for model in ((args.model,) if args.model else (('one-pro',) if args.compare_onepro_warp else ('one-pro', 'one'))):
+    # The 1.9.1 mesh kernel is byte-identical for One and One Pro (shared Pilot
+    # 1.9.1), so the stock-mesh Real3D row is offered on One as well. One remains
+    # experimental and hardware-unverified; its display/stereo path is not the
+    # same as One Pro and the visible effect must be confirmed on the device.
+    for model in ((args.model,) if args.model else ('one-pro', 'one')):
         files = dict(contents)
         files['pilot/bin/libxreal_cpu_adapter.so'] = library.read_bytes()
         if args.compare_onepro_warp:
@@ -133,16 +164,14 @@ def build(args):
             from ui_fast import apply
             ui_fast = apply(files, model)
         general = config(files['pilot/conf/pilot_default_config.json'])
-        assert general['state_machine']['space_screen']['frame_rate_boost_enable'] is False
-        assert general['state_machine']['space_screen']['over_clocking_mode'] == 0
-        assert general['display']['dp']['synth_stereo'] == '1920_1080_60'
+        check_display_defaults(general)
         manifest = dict(provenance, schema=2, profile=model+'-603',
                         soc=SOC, pilot=PILOT, abi_libraries=ABI_LIBRARIES,
                         mmz=[MMZ_START, MMZ_END],
                         verification='candidate; physical mode/performance tests required')
         if args.compare_onepro_warp:
             manifest['comparison'] = {
-                'scope': 'One Pro vendor mesh versus current Pro+ CPU port; shared Pilot 2 depth inference',
+                'scope': 'Stock 1.9.1 vendor mesh versus current Pro+ CPU port; shared Pilot 2 depth inference',
                 'onepro_mesh_sha256': MESH_SHA, 'libdl_sha256': DL_SHA,
                 'menu': 'Two Real3D mode entries; independent native four-level strength',
                 'default': 'Pro+ CPU port', 'physical_comparison': 'pending'}
@@ -189,8 +218,11 @@ if __name__ == '__main__':
                    help='Diagnostic build: save one bounded input/warped/depth PGM capture on device')
     p.add_argument('--ui-fast', action='store_true',
                    help='Local test: cache unchanged comparison layout and sample HDR timings every 1800 frames')
+    p.add_argument('--hdr-sample-frames', type=int,
+                   help='Diagnostic build: log HDR stage timings once per this many frames '
+                        '(default 30, or 1800 with --ui-fast)')
     p.add_argument('--compare-onepro-warp', action='store_true',
-                   help='One Pro only: two mesh algorithms, shared Pilot 2 depth; test menu')
+                   help='Two Real3D rows: stock 1.9.1 vendor mesh + Pro+ CPU port; shared Pilot 2 depth; test menu')
     p.add_argument('--onepro-mesh', type=Path,
                    default=ROOT/'work/3d-lab/vendor-compare/onepro-libnr_depth_manager.so')
     build(p.parse_args())
