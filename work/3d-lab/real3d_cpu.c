@@ -40,6 +40,25 @@ extern int nanosleep(const struct timespec *, struct timespec *);
 #define PACE_US 0ULL
 static u64 pace_last_start, pace_slept_us, pace_late;
 
+/* Diagnostic heartbeat: index of the Process call currently running and of the
+ * last one that returned. One pwrite per frame, fixed 48-byte record, so a
+ * frozen picture can be classified: in = out + 1 means the adapter is stuck
+ * inside that frame, in = out means Pilot stopped calling us. */
+#define HEARTBEAT "/usrdata/real3d-heartbeat.txt"
+static int heartbeat_fd = -1;
+static int heartbeat_in, heartbeat_out;
+
+static void heartbeat(int entered, int done) {
+    char line[48];
+    int n;
+    if (heartbeat_fd < 0) return;
+    n = snprintf(line, sizeof(line), "entered=%d done=%d", entered, done);
+    if (n <= 0 || n >= (int)sizeof(line)) return;
+    for (int i = n; i < 47; ++i) line[i] = ' ';
+    line[47] = '\n';
+    (void)pwrite(heartbeat_fd, line, 48, 0);
+}
+
 extern void *ar_hal_sys_mmap_cache(u64, u32);
 extern int ar_hal_sys_munmap(void *, u32);
 extern int ar_hal_sys_mmz_invalid_cache(u64, void *, u32);
@@ -1762,6 +1781,7 @@ int xreal_real3d_rpc(u32 core, const struct rpc *call, u32 sync) {
         if (call->length != 8) return -22;
         u64 result = *(const u64 *)call->args;
         initialized = 0;
+        if (heartbeat_fd >= 0) { (void)close(heartbeat_fd); heartbeat_fd = -1; }
         int rc = set_result(result, 0);
         diagnostic("close", NULL, rc);
         return rc;
@@ -1770,6 +1790,8 @@ int xreal_real3d_rpc(u32 core, const struct rpc *call, u32 sync) {
         if (call->length != sizeof(struct real3d_frame)) return -22;
         const struct real3d_frame *f = call->args;
         u64 call_start = monotonic_us();
+        heartbeat_in = (int)frames;
+        heartbeat(heartbeat_in, heartbeat_out);
         int rc = process_frame(f);
         if (rc || frames < 3 || frames % 300 == 0) {
 #ifdef XREAL_COMPARE_ONEPRO_WARP
@@ -1784,9 +1806,13 @@ int xreal_real3d_rpc(u32 core, const struct rpc *call, u32 sync) {
              * Only a fully validated descriptor permits a status write.
              * Runtime map/flush failures must not leave an old success flag. */
             if (!validate_frame(f)) (void)set_result(f->result, rc);
+            heartbeat_out = heartbeat_in;
+            heartbeat(heartbeat_in, heartbeat_out);
             return rc;
         }
         ++frames;
+        heartbeat_out = (int)frames - 1;
+        heartbeat(heartbeat_in, heartbeat_out);
         int status = set_result(f->result, 0);
         if (pace_last_start) {
             /* perf10 fix: from THIS call's start (perf9 used the previous
