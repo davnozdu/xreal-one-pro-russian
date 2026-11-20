@@ -104,57 +104,21 @@ struct frame_args {u64 planes[3],result; u32 strides[3],width,height;};
 _Static_assert(__builtin_offsetof(struct rpc,args)==40,"RPC ABI");
 _Static_assert(__builtin_offsetof(struct frame_args,width)==44,"frame ABI");
 static int valid(u64 p,u64 n) {return n && p>=0x33000000 && p<0x40000000 && n<=0x40000000-p;}
-/* perf30: 24-entry MMZ mmap cache for Pilot's fixed rotating ring buffers.
- * Eliminates per-frame mmap_cache + munmap (~2.5-3.3 ms/frame on A53) while
- * always invalidating input cache before read and flushing after write.
- * Cleared on Init, Close, and any map error. */
-#define MMZ_CACHE_CAP 24
-struct mmz_slot {u64 pa; u32 size; void *va;};
-static struct mmz_slot mmz_cache[MMZ_CACHE_CAP];
-static u32 mmz_evict_idx;
-static void mmz_cache_clear(void) {
-    for(u32 i=0;i<MMZ_CACHE_CAP;i++) {
-        if(mmz_cache[i].va) {
-            ar_hal_sys_munmap(mmz_cache[i].va,mmz_cache[i].size);
-            mmz_cache[i].va=(void *)0;
-            mmz_cache[i].pa=0;
-            mmz_cache[i].size=0;
-        }
-    }
-    mmz_evict_idx=0;
-}
 static void *map(u64 p,u32 n) {
     if(!valid(p,n)){trace("invalid physical range",p,n,0);return (void *)0;}
-    void *v=(void *)0;
-    for(u32 i=0;i<MMZ_CACHE_CAP;i++) {
-        if(mmz_cache[i].va && mmz_cache[i].pa==p && mmz_cache[i].size==n) {
-            v=mmz_cache[i].va;
-            break;
-        }
-    }
-    if(!v) {
-        v=ar_hal_sys_mmap_cache(p,n);
-        if(!v || v==(void *)-1){trace("mmap_cache failed",p,n,(long)v);return (void *)0;}
-        u32 slot=MMZ_CACHE_CAP;
-        for(u32 i=0;i<MMZ_CACHE_CAP;i++)if(!mmz_cache[i].va){slot=i;break;}
-        if(slot==MMZ_CACHE_CAP) {
-            slot=mmz_evict_idx;
-            mmz_evict_idx=(mmz_evict_idx+1)%MMZ_CACHE_CAP;
-            ar_hal_sys_munmap(mmz_cache[slot].va,mmz_cache[slot].size);
-        }
-        mmz_cache[slot]=(struct mmz_slot){p,n,v};
-    }
+    void *v=ar_hal_sys_mmap_cache(p,n);
+    if(!v || v==(void *)-1){trace("mmap_cache failed",p,n,(long)v);return (void *)0;}
     int rc=ar_hal_sys_mmz_invalid_cache(p,v,n);
     /* This vendor build returns 0x80028003 when the invalidate ioctl
      * succeeds (confirmed in libhal_sys.so and on the physical device). */
-    if(rc!=0 && (u32)rc!=0x80028003u){trace("invalid_cache failed",p,n,rc);mmz_cache_clear();return (void *)0;}
+    if(rc!=0 && (u32)rc!=0x80028003u){trace("invalid_cache failed",p,n,rc);ar_hal_sys_munmap(v,n);return (void *)0;}
     return v;
 }
 static int result(u64 p,int value) {
     int *v=map(p,64);if(!v){trace("result map failed",p,64,value);return -5;}
     *v=value;int rc=ar_hal_sys_mmz_flush_cache_pa(p,64);
     if(rc)trace("result PA flush failed",p,64,rc);
-    return rc ? -5 : 0;
+    ar_hal_sys_munmap(v,64);return rc ? -5 : 0;
 }
 struct build_job {const u16 *cube;u64 *table;u32 begin,end;int rc;};
 static void *build_worker(void *arg) {
@@ -280,11 +244,7 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         /* Validate the result before allocating or changing current state. */
         if(!valid(a->result,64)||!valid(a->lut,14739)||
            (a->result<a->lut+14739 && a->lut<a->result+64))return -22;
-        mmz_cache_clear();
-        u8 *p=ar_hal_sys_mmap_cache(a->lut,14739);
-        if(!p || p==(void *)-1){trace("LUT map failed",a->lut,14739,0);return -5;}
-        {int irc=ar_hal_sys_mmz_invalid_cache(a->lut,p,14739);
-         if(irc!=0 && (u32)irc!=0x80028003u){ar_hal_sys_munmap(p,14739);return -5;}}
+        u8 *p=map(a->lut,14739);if(!p){trace("LUT map failed",a->lut,14739,0);return -5;}
         /* DSP ABI carries three 17^3 channel planes, not RGB triplets. */
         u16 cube[14739];
         for(u32 i=0;i<4913;i++)for(u32 c=0;c<3;c++)
@@ -333,10 +293,7 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         if(!valid(p,64))return -22;
         record("LUT closing",0);free(dense);dense=(void *)0;
         free(compact);compact=(void *)0;free(tetra);tetra=(void *)0;dd_reset();
-        choice=-1;
-        int status=result(p,0);
-        mmz_cache_clear();
-        return status;
+        choice=-1;return result(p,0);
     }
     if(strcmp(call->name,"ArArmlut3dProcessRgbToYuv"))return xreal_real3d_rpc(core,call,sync);
     if(call->length!=52 || (choice==0 ? !dense : choice==5 ? !tetra : !compact))return -22;
@@ -434,7 +391,7 @@ static int dispatch_rpc(u32 core,const struct rpc *call,u32 sync) {
         }
     }
 done:
-    if(rc)mmz_cache_clear();
+    for(u32 i=0;i<3;i++)if(planes[i])ar_hal_sys_munmap(planes[i],sizes[i]);
     long unmapped_us=now_us();
     if(!rc && choice>=0) {
         long busy=now_us()-call_start_us;

@@ -146,51 +146,13 @@ static int valid(u64 address, u32 bytes) {
            bytes <= 0x40000000ULL - address;
 }
 
-/* perf30: 32-entry MMZ mmap cache for Pilot's fixed Real3D buffer pool
- * (dst/depth/result never change; src rotates over 6 buffers). Saves ~2-3.5 ms
- * of mmap_cache + munmap per frame while preserving input cache invalidation
- * and output flush. Cleared on Init, Close, and any map/flush error. */
-#define R3D_MMZ_CAP 32
-struct r3d_mmz_slot { u64 pa; u32 size; void *va; };
-static struct r3d_mmz_slot r3d_mmz[R3D_MMZ_CAP];
-static u32 r3d_mmz_evict;
-
-static void r3d_mmz_clear(void) {
-    for (u32 i = 0; i < R3D_MMZ_CAP; ++i) {
-        if (r3d_mmz[i].va) {
-            ar_hal_sys_munmap(r3d_mmz[i].va, r3d_mmz[i].size);
-            r3d_mmz[i].va = NULL;
-            r3d_mmz[i].pa = 0;
-            r3d_mmz[i].size = 0;
-        }
-    }
-    r3d_mmz_evict = 0;
-}
-
-static void *r3d_mmz_get(u64 address, u32 bytes) {
+static void *map(u64 address, u32 bytes) {
     if (!valid(address, bytes)) return NULL;
-    for (u32 i = 0; i < R3D_MMZ_CAP; ++i)
-        if (r3d_mmz[i].va && r3d_mmz[i].pa == address && r3d_mmz[i].size == bytes)
-            return r3d_mmz[i].va;
     void *p = ar_hal_sys_mmap_cache(address, bytes);
     if (!p || p == (void *)-1) return NULL;
-    u32 slot = R3D_MMZ_CAP;
-    for (u32 i = 0; i < R3D_MMZ_CAP; ++i) if (!r3d_mmz[i].va) { slot = i; break; }
-    if (slot == R3D_MMZ_CAP) {
-        slot = r3d_mmz_evict;
-        r3d_mmz_evict = (r3d_mmz_evict + 1) % R3D_MMZ_CAP;
-        ar_hal_sys_munmap(r3d_mmz[slot].va, r3d_mmz[slot].size);
-    }
-    r3d_mmz[slot] = (struct r3d_mmz_slot){ address, bytes, p };
-    return p;
-}
-
-static void *map(u64 address, u32 bytes) {
-    void *p = r3d_mmz_get(address, bytes);
-    if (!p) return NULL;
     int rc = ar_hal_sys_mmz_invalid_cache(address, p, bytes);
     if (rc && (u32)rc != 0x80028003U) {
-        r3d_mmz_clear();
+        ar_hal_sys_munmap(p, bytes);
         return NULL;
     }
     return p;
@@ -203,7 +165,10 @@ static void *map(u64 address, u32 bytes) {
  * invalidate. */
 static void *map_output(u64 address, u32 bytes, u32 stride) {
     if ((address & 63) || (stride & 63)) return map(address, bytes);
-    return r3d_mmz_get(address, bytes);
+    if (!valid(address, bytes)) return NULL;
+    void *p = ar_hal_sys_mmap_cache(address, bytes);
+    if (!p || p == (void *)-1) return NULL;
+    return p;
 }
 
 static int set_result(u64 address, int result) {
@@ -211,6 +176,7 @@ static int set_result(u64 address, int result) {
     if (!p) return -5;
     *p = result;
     int rc = ar_hal_sys_mmz_flush_cache_pa(address, 64);
+    ar_hal_sys_munmap(p, 64);
     return rc ? -5 : 0;
 }
 
@@ -1771,7 +1737,11 @@ static int process_frame(const struct real3d_frame *f) {
     }
 #endif
 done:
-    if (rc) r3d_mmz_clear();
+    for (u32 channel = 0; channel < 3; ++channel) {
+        if (destination[channel]) ar_hal_sys_munmap(destination[channel], dst_sizes[channel]);
+        if (source[channel]) ar_hal_sys_munmap(source[channel], src_sizes[channel]);
+    }
+    ar_hal_sys_munmap(z, depth_size);
     return rc;
 }
 
@@ -1779,7 +1749,6 @@ int xreal_real3d_rpc(u32 core, const struct rpc *call, u32 sync) {
     if (core || !call || sync != 1 || !call->args) return -22;
     if (!strcmp(call->name, "ArArmWarp2DTo3DInit")) {
         if (call->length != 8) return -22;
-        r3d_mmz_clear();
         u64 result = *(const u64 *)call->args;
         int rc = set_result(result, 0);
         initialized = rc == 0;
@@ -1794,7 +1763,6 @@ int xreal_real3d_rpc(u32 core, const struct rpc *call, u32 sync) {
         u64 result = *(const u64 *)call->args;
         initialized = 0;
         int rc = set_result(result, 0);
-        r3d_mmz_clear();
         diagnostic("close", NULL, rc);
         return rc;
     }
