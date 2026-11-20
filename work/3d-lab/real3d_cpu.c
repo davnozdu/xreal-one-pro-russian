@@ -1096,12 +1096,8 @@ static int warp_luma_q5_fast(const u8 *src, u8 *dst, const u16 *depth_q5,
                 u32 right = blend[cx + 1 < depth_width ? cx + 1 : cx];
                 u32 dl = left > mid ? left - mid : mid - left;
                 u32 dr = right > mid ? right - mid : mid - right;
-                /* perf34: across a cliff keep 1/8 of the neighbour's
-                 * displacement instead of a hard clamp, so a diagonal
-                 * silhouette moves by fractional pixels instead of whole
-                 * 4-pixel treads. */
-                u32 l_eff = dl > CLIFF_Q5 ? (mid * 7 + left) >> 3 : left;
-                u32 r_eff = dr > CLIFF_Q5 ? (mid * 7 + right) >> 3 : right;
+                u32 l_eff = dl > CLIFF_Q5 ? mid : left;
+                u32 r_eff = dr > CLIFF_Q5 ? mid : right;
                 u32 dl_eff = l_eff > mid ? l_eff - mid : mid - l_eff;
                 u32 dr_eff = r_eff > mid ? r_eff - mid : mid - r_eff;
                 if (dl_eff > HFLAT || dr_eff > HFLAT) {
@@ -1195,17 +1191,20 @@ static int warp_chroma_pair_q5_fast(const u8 *u_src, u8 *u_dst, const u8 *v_src,
             for (u32 cx = 0, x = 0; cx < depth_width; ++cx, x += 2) {
                 u32 mid = blend[cx];
                 u32 q = x * 32 + mid, sx = q >> 5, frac = q & 31;
-                /* perf34: chroma now follows luma's sub-cell rule. Without it
-                 * the 2-pixel chroma cell took one displacement, so the colour
-                 * edge sat on a 2-pixel grid while luma was already fractional:
-                 * that mismatch is the fringe seen around objects. */
+                /* perf34: chroma now follows luma's own rule, including its
+                 * cliff guard. Without any horizontal step the 2-pixel chroma
+                 * cell took one displacement, so the colour edge sat on a
+                 * 2-pixel grid while luma was already fractional: that
+                 * mismatch is the fringe seen around objects. A cliff is left
+                 * untouched exactly like luma, so the two planes cannot
+                 * disagree about where the edge is. */
                 {
                     u32 left = blend[cx ? cx - 1 : cx];
                     u32 right = blend[cx + 1 < depth_width ? cx + 1 : cx];
                     u32 dl = left > mid ? left - mid : mid - left;
                     u32 dr = right > mid ? right - mid : mid - right;
-                    u32 l_eff = dl > CLIFF_Q5 ? (mid * 7 + left) >> 3 : left;
-                    u32 r_eff = dr > CLIFF_Q5 ? (mid * 7 + right) >> 3 : right;
+                    u32 l_eff = dl > CLIFF_Q5 ? mid : left;
+                    u32 r_eff = dr > CLIFF_Q5 ? mid : right;
                     u32 dl_eff = l_eff > mid ? l_eff - mid : mid - l_eff;
                     u32 dr_eff = r_eff > mid ? r_eff - mid : mid - r_eff;
                     if (dl_eff > HFLAT || dr_eff > HFLAT) {
