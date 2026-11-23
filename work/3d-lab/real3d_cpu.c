@@ -1013,7 +1013,7 @@ static int warp_chroma_pair_range(const u8 *u_src, u8 *u_dst, const u8 *v_src, u
 }
 
 /* perf24: live chroma path with reprojection off (clean perf15-20 joint U/V). */
-static int warp_chroma_pair_clean_range(const u8 *u_src, u8 *u_dst, const u8 *v_src, u8 *v_dst,
+__attribute__((unused)) static int warp_chroma_pair_clean_range(const u8 *u_src, u8 *u_dst, const u8 *v_src, u8 *v_dst,
                                   const u8 *depth, u32 width, u32 height,
                                   u32 u_src_stride, u32 u_dst_stride,
                                   u32 v_src_stride, u32 v_dst_stride, u32 depth_width,
@@ -1335,6 +1335,96 @@ static int warp_chroma_pair_q5_fast(const u8 *u_src, u8 *u_dst, const u8 *v_src,
     return 0;
 }
 
+static int warp_chroma_pair_bilinear_fast(const u8 *u_src, u8 *u_dst, const u8 *v_src, u8 *v_dst,
+                                          const u8 *depth, u32 width, u32 height,
+                                          u32 u_src_stride, u32 u_dst_stride,
+                                          u32 v_src_stride, u32 v_dst_stride, u32 depth_width,
+                                          u32 depth_height, u32 begin, u32 end, u32 fractional_bits) {
+    if (fractional_bits < 2 || fractional_bits > 4 ||
+        !depth_width || !depth_height || depth_width > 480 ||
+        !u_src || !u_dst || !v_src || !v_dst || !depth ||
+        u_src_stride < width || u_dst_stride < width ||
+        v_src_stride < width || v_dst_stride < width ||
+        width != depth_width * 2 || height != depth_height * 2 ||
+        begin > end || end > depth_height) return -22;
+    u32 shift = 4 - fractional_bits;
+    u16 here[480], above[480], below[480], blend[480];
+    for (u32 zy = begin; zy < end; ++zy) {
+        const u8 *z = depth + (size_t)zy * depth_width;
+        const u8 *up = depth + (size_t)(zy ? zy - 1 : zy) * depth_width;
+        const u8 *down = depth + (size_t)(zy + 1 < depth_height ? zy + 1 : zy) * depth_width;
+        depth_shift_row(here, z, depth_width, shift);
+        depth_shift_row(above, up, depth_width, shift);
+        depth_shift_row(below, down, depth_width, shift);
+        for (u32 ry = 0; ry < 2; ++ry) {
+            const u16 *other = ry == 0 ? above : below;
+            u32 zx = 0;
+#if defined(__aarch64__) && !defined(XREAL_NO_NEON)
+            for (; zx + 8 <= depth_width; zx += 8) {
+                uint16x8_t h = vld1q_u16(here + zx);
+                uint16x8_t o = vld1q_u16(other + zx);
+                uint16x8_t b = vaddq_u16(vaddq_u16(h, vshlq_n_u16(h, 1)), o);
+                vst1q_u16(blend + zx, vrshrq_n_u16(b, 2));
+            }
+#endif
+            for (; zx < depth_width; ++zx)
+                blend[zx] = (u16)((here[zx] * 3 + other[zx] + 2) >> 2);
+            u32 y = zy * 2 + ry;
+            const u8 *s1 = u_src + (size_t)y * u_src_stride;
+            u8 *d1 = u_dst + (size_t)y * u_dst_stride;
+            const u8 *s2 = v_src + (size_t)y * v_src_stride;
+            u8 *d2 = v_dst + (size_t)y * v_dst_stride;
+            for (u32 cx = 0, x = 0; cx < depth_width; ++cx, x += 2) {
+                u32 mid = blend[cx];
+                u32 left = blend[cx ? cx - 1 : cx];
+                u32 right = blend[cx + 1 < depth_width ? cx + 1 : cx];
+                u32 dl = left > mid ? left - mid : mid - left;
+                u32 dr = right > mid ? right - mid : mid - right;
+                if (dl > 2U || dr > 2U) {
+                    int q0 = (int)(x * 32 + ((3 * mid + left + 2) >> 2));
+                    int q1 = (int)((x + 1) * 32 + ((3 * mid + right + 2) >> 2));
+                    d1[x] = sample_q5(s1, q0, width);
+                    d2[x] = sample_q5(s2, q0, width);
+                    d1[x + 1] = sample_q5(s1, q1, width);
+                    d2[x + 1] = sample_q5(s2, q1, width);
+                    continue;
+                }
+                u32 q = x * 32 + mid, sx = q >> 5, frac = q & 31;
+                if (cx + 1 < depth_width && right == mid) {
+                    u32 r2 = blend[cx + 2 < depth_width ? cx + 2 : cx + 1];
+                    u32 dr2 = r2 > mid ? r2 - mid : mid - r2;
+                    if (dr2 <= 2U) {
+                        if (!frac && sx + 4 <= width) {
+                            __builtin_memcpy(d1 + x, s1 + sx, 4);
+                            __builtin_memcpy(d2 + x, s2 + sx, 4);
+                            ++cx; x += 2;
+                            continue;
+                        }
+                        if (frac && sx + 4 < width) {
+                            sample_cell4(d1 + x, s1 + sx, frac);
+                            sample_cell4(d2 + x, s2 + sx, frac);
+                            ++cx; x += 2;
+                            continue;
+                        }
+                    }
+                }
+                if (!frac && sx + 2 <= width) {
+                    __builtin_memcpy(d1 + x, s1 + sx, 2);
+                    __builtin_memcpy(d2 + x, s2 + sx, 2);
+                } else if (sx + 2 < width) {
+                    sample_cell2_pair(d1 + x, s1 + sx, d2 + x, s2 + sx, frac);
+                } else {
+                    for (u32 k = 0; k < 2; ++k) {
+                        d1[x + k] = sample_q5(s1, (int)q + (int)k * 32, width);
+                        d2[x + k] = sample_q5(s2, (int)q + (int)k * 32, width);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static void *segment_worker(void *arg) {
     struct segment_job *j = arg;
     j->rc = 0;
@@ -1343,30 +1433,15 @@ static void *segment_worker(void *arg) {
         u32 first = j->begin + chunk * SEGMENT_ROWS;
         if (first >= j->end) break;
         u32 last = first + SEGMENT_ROWS < j->end ? first + SEGMENT_ROWS : j->end;
-        int rc;
-        if (j->depth_q5) {
-            u32 q5_w = j->depth_width * 2U;
-            rc = warp_luma_q5_fast(j->src[0], j->dst[0], j->depth_q5, j->width[0],
-                                   j->height[0], j->src_stride[0], j->dst_stride[0],
-                                   q5_w, j->depth_height, first, last);
-            if (rc && !j->rc) j->rc = rc;
-            rc = warp_chroma_pair_q5_fast(j->src[1], j->dst[1], j->src[2], j->dst[2],
-                                          j->depth_q5, j->width[1], j->height[1],
-                                          j->src_stride[1], j->dst_stride[1],
-                                          j->src_stride[2], j->dst_stride[2],
-                                          q5_w, j->depth_height, first, last);
-            if (rc && !j->rc) j->rc = rc;
-            continue;
-        }
-        rc = warp_plane_cells_bilinear_range(j->src[0], j->dst[0], j->depth, j->width[0],
-                                       j->height[0], j->src_stride[0], j->dst_stride[0],
-                                       j->depth_width, j->depth_height, first, last,
-                                       j->fractional_bits);
+        int rc = warp_luma_bilinear_fast(j->src[0], j->dst[0], j->depth, j->width[0],
+                                         j->height[0], j->src_stride[0], j->dst_stride[0],
+                                         j->depth_width, j->depth_height, first, last,
+                                         j->fractional_bits);
         if (rc && !j->rc) j->rc = rc;
-        rc = warp_chroma_pair_clean_range(j->src[1], j->dst[1], j->src[2], j->dst[2], j->depth,
-                                    j->width[1], j->height[1], j->src_stride[1], j->dst_stride[1],
-                                    j->src_stride[2], j->dst_stride[2], j->depth_width,
-                                    j->depth_height, first, last, j->fractional_bits);
+        rc = warp_chroma_pair_bilinear_fast(j->src[1], j->dst[1], j->src[2], j->dst[2], j->depth,
+                                            j->width[1], j->height[1], j->src_stride[1], j->dst_stride[1],
+                                            j->src_stride[2], j->dst_stride[2], j->depth_width,
+                                            j->depth_height, first, last, j->fractional_bits);
         if (rc && !j->rc) j->rc = rc;
     }
     return NULL;
@@ -1562,7 +1637,7 @@ int real3d_zbuf_project_for_test(const u8 *z, u8 *out, u32 dw, u32 dh, u32 fract
 static u16 depth_q5_buf[960 * 270];
 static int ema_ready, ema_p05_q8, ema_p95_q8;
 
-static void compute_adaptive_depth_params(const u8 *z, u32 size, u32 fractional_bits,
+__attribute__((unused)) static void compute_adaptive_depth_params(const u8 *z, u32 size, u32 fractional_bits,
                                           u32 *z_floor_out, u32 *scale_q8_out) {
     u32 hist[256];
     for (u32 i = 0; i < 256; ++i) {
@@ -1709,7 +1784,7 @@ struct zbuf_q5_job {
     u32 *next;
 };
 
-static void *zbuf_q5_worker(void *arg) {
+__attribute__((unused)) static void *zbuf_q5_worker(void *arg) {
     struct zbuf_q5_job *j = arg;
     for (;;) {
         u32 chunk = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
@@ -1749,6 +1824,45 @@ int real3d_zbuf_q5_chroma_warp_for_test(const u8 *u_src, u8 *u_dst,
     return warp_chroma_pair_q5_fast(u_src, u_dst, v_src, v_dst, depth_q5_buf,
                                     width, height, stride, stride, stride, stride,
                                     dw * 2U, dh, 0, dh);
+}
+
+/* perf36: clean continuous rubber-sheet depth pre-pass (3x3 [1,2,1]x[1,2,1]/16
+ * smoothing + 1.15x gentle gain + horizontal monotonic non-folding clamp).
+ * Eliminates the Z-buffer/CLIFF_Q5 binary mask (zero staircase, zero mirrored
+ * disocclusion holes, respects the menu depth slider) while guaranteeing
+ * x + d(x) is strictly monotonically increasing (1 + d'(x) >= +0.125 > 0) so
+ * backward warp can never fold over and repeat an object's edge (zero halo). */
+#define REAL3D_SMOOTH_GAIN_Q8 294U   /* 1.15x gentle boost */
+static u8 depth_smooth_buf[480 * 270];
+
+static void depth_smooth_prepass(const u8 *z, u8 *out, u32 dw, u32 dh, u32 fractional_bits) {
+    u32 max_drop = (7U << fractional_bits) >> 1; /* 3.5 luma px per 4-px cell */
+    for (u32 y = 0; y < dh; ++y) {
+        const u8 *ru = z + (size_t)(y ? y - 1 : y) * dw;
+        const u8 *rc = z + (size_t)y * dw;
+        const u8 *rd = z + (size_t)(y + 1 < dh ? y + 1 : y) * dw;
+        u8 *o = out + (size_t)y * dw;
+        u32 prev = 0;
+        for (u32 x = 0; x < dw; ++x) {
+            u32 xl = x ? x - 1 : x;
+            u32 xr = x + 1 < dw ? x + 1 : x;
+            u32 vl = (u32)ru[xl] + 2U * (u32)rc[xl] + (u32)rd[xl];
+            u32 vc = (u32)ru[x]  + 2U * (u32)rc[x]  + (u32)rd[x];
+            u32 vr = (u32)ru[xr] + 2U * (u32)rc[xr] + (u32)rd[xr];
+            u32 s = vl + 2U * vc + vr;
+            u32 v = (s * REAL3D_SMOOTH_GAIN_Q8 + 2048U) >> 12;
+            if (v > 255U) v = 255U;
+            if (x > 0 && v + max_drop < prev) v = prev - max_drop;
+            o[x] = (u8)v;
+            prev = v;
+        }
+    }
+}
+
+int real3d_depth_smooth_prepass_for_test(const u8 *z, u8 *out, u32 dw, u32 dh, u32 fractional_bits) {
+    if (!z || !out || !dw || dw > 480 || !dh || fractional_bits < 2 || fractional_bits > 4) return -22;
+    depth_smooth_prepass(z, out, dw, dh, fractional_bits);
+    return 0;
 }
 
 static int process_frame(const struct real3d_frame *f) {
@@ -1802,27 +1916,17 @@ static int process_frame(const struct real3d_frame *f) {
 #endif
     if (!side_by_side && chroma_half && f->width == 1920 && f->height == 1080) {
         /* Four independent depth-row segments on the four Cortex-A53 cores. */
-        const u16 *dq5 = NULL;
-        if (f->depth_width <= 480 && f->depth_width * depth_height <= 480U * 270U) {
-            u32 z_floor = 0, scale_q8 = 256U;
-            compute_adaptive_depth_params(z, f->depth_width * depth_height,
-                                          f->fractional_bits, &z_floor, &scale_q8);
-            struct zbuf_q5_job zjobs[4];
-            u32 znext = 0;
-            for (u32 i = 0; i < 4; ++i)
-                zjobs[i] = (struct zbuf_q5_job){
-                    .z = z, .out = depth_q5_buf, .dw = f->depth_width, .dh = depth_height,
-                    .fractional_bits = f->fractional_bits, .z_floor = z_floor,
-                    .scale_q8 = scale_q8, .next = &znext,
-                };
-            xreal_parallel_run(zbuf_q5_worker, zjobs, sizeof(zjobs[0]), 4);
-            dq5 = depth_q5_buf;
+        const u8 *zp = z;
+        if (f->depth_width <= 480 && f->depth_width * depth_height <= sizeof(depth_smooth_buf)) {
+            depth_smooth_prepass(z, depth_smooth_buf, f->depth_width, depth_height,
+                                 f->fractional_bits);
+            zp = depth_smooth_buf;
         }
         struct segment_job jobs[4];
         u32 next_chunk = 0;
         for (u32 i = 0; i < 4; ++i) {
             jobs[i] = (struct segment_job){
-                .depth = z, .depth_q5 = dq5, .depth_width = f->depth_width,
+                .depth = zp, .depth_q5 = NULL, .depth_width = f->depth_width,
                 .depth_height = depth_height, .fractional_bits = f->fractional_bits,
                 .begin = 0, .end = depth_height, .next = &next_chunk, .rc = 0,
             };

@@ -203,7 +203,21 @@ def main(path):
     # Disocclusion zone (932..959) must be clean background (40), NOT stretched 220 halo
     assert all(rb[x] < 100 for x in range(936, 960)), ('disocc-bleed-halo', rb[936:960])
 
-    print(f'Real3D perf23/28/29/35 reprojection & Q5 Z-buffer oracle passed: {cases} cases (luma, joint U/V, 1D Z-buf, thin-wire, vcliff, diag, chroma, disocc)')
+    # perf36: continuous 3x3 smooth + monotonic non-folding depth pre-pass (zero duplicate-edge halo)
+    sm_pre = lib.real3d_depth_smooth_prepass_for_test
+    sm_pre.argtypes = [C.c_char_p, C.c_char_p, C.c_uint, C.c_uint, C.c_uint]
+    z_step = bytearray([10]*(480*4))
+    for y in range(4):
+        for c in range(200, 240):
+            z_step[y*480 + c] = 160
+    z_sm = C.create_string_buffer(480*4)
+    assert sm_pre(bytes(z_step), z_sm, 480, 4, 3) == 0
+    row_sm = list(z_sm.raw[480:960])
+    # Source sampling position 4*c + d(c)/8 must be strictly monotonically increasing across every cell
+    src_pos = [4.0*c + row_sm[c]/8.0 for c in range(480)]
+    assert all(src_pos[c+1] > src_pos[c] for c in range(479)), 'non-monotonic-foldover'
+
+    print(f'Real3D perf23/28/29/35/36 reprojection & smooth non-folding oracle passed: {cases} cases')
 
 
 if __name__ == '__main__':
