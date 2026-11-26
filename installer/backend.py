@@ -9,7 +9,7 @@ import time
 import zipfile
 
 from package_format import container_crc, read_container, bounded_zip, MAX_CONTAINER, MAX_FILE
-from profiles import validate_build, check_abi
+from profiles import validate_build, check_abi, export_file
 
 import hid
 
@@ -195,14 +195,10 @@ def verify_files(probe, expected, emit):
     for index, (name, digest) in enumerate(expected.items()):
         emit(f'Проверка установленных файлов: {index+1} из {len(expected)}',
              90+index*9/max(1, len(expected)-1))
-        result = probe.export('/usrdata/'+name, max_bytes=MAX_FILE)
-        if result['start_status'] != 0 or result.get('finish_status') != 0:
-            raise RuntimeError('Не удалось прочитать установленный файл: '+name)
-        with zipfile.ZipFile(io.BytesIO(result['data'])) as z:
-            matches = [i for i in z.infolist() if not i.is_dir() and i.filename.rsplit('/', 1)[-1] == name.rsplit('/', 1)[-1]]
-            if (len(matches) != 1 or matches[0].file_size > MAX_FILE or
-                    hashlib.sha256(z.read(matches[0])).hexdigest() != digest):
-                raise RuntimeError('Проверка установленного файла не пройдена: '+name)
+        data = export_file(probe, '/usrdata/'+name, MAX_FILE,
+                           message='Не удалось прочитать установленный файл: ')
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError('Проверка установленного файла не пройдена: '+name)
 
 
 def verify_selected(selected, expected, emit, probe_factory=SelectedProbe, sleep=time.sleep,

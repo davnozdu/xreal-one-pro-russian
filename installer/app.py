@@ -50,7 +50,9 @@ def platform_fonts():
 
 def choose_theme(style):
     names = style.theme_names()
-    preferred = {'darwin': 'aqua', 'win32': 'vista'}.get(sys.platform)
+    # Use consistent Tcl-drawn controls on macOS. A supported Tk runtime is
+    # still required; changing themes cannot repair Apple's obsolete Tk 8.5.
+    preferred = {'darwin': 'clam', 'win32': 'vista'}.get(sys.platform)
     return (preferred if preferred in names else
             'clam' if 'clam' in names else names[0])
 
@@ -64,87 +66,126 @@ class App:
         self.build = None
         self.last_support = None
         root.title(f'XREAL One / One Pro / 1S · Русское меню · v{VERSION}')
-        scale = float(root.tk.call('tk', 'scaling')) / (96 / 72)
+        scale = 1 if sys.platform == 'darwin' else float(root.tk.call('tk', 'scaling')) / (96 / 72)
         left, top, right, bottom = 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
         if sys.platform == 'win32':
             from ctypes.wintypes import RECT
             area = RECT()
             if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(area), 0):
                 left, top, right, bottom = area.left, area.top, area.right, area.bottom
-        width = min(round(720 * scale), max(200, right-left-40))
-        height = min(round(640 * scale), max(180, bottom-top-80))
+        width = min(round(760 * scale), max(200, right-left-40))
+        height = min(round(790 * scale), max(180, bottom-top-80))
         root.geometry(f'{width}x{height}+{left+20}+{top+20}')
         root.minsize(min(320, width), min(220, height))
         root.protocol('WM_DELETE_WINDOW', self.close)
         self.ui_font, self.mono_font = platform_fonts()
         style = ttk.Style()
         style.theme_use(choose_theme(style))
-        style.configure('TLabel', font=(self.ui_font, 11))
-        style.configure('TButton', font=(self.ui_font, 11), padding=8)
+        background, ink, muted = '#eef3fa', '#172b4d', '#61728b'
+        blue, white = '#2563eb', '#ffffff'
+        style.configure('TFrame', background=background)
+        style.configure('Card.TFrame', background=white)
+        style.configure('TLabel', background=background, foreground=ink, font=(self.ui_font, 11))
+        style.configure('Muted.TLabel', foreground=muted)
+        style.configure('Brand.TLabel', foreground='#7754d9', font=(self.ui_font, 10, 'bold'))
+        style.configure('Title.TLabel', font=(self.ui_font, 26, 'bold'))
+        style.configure('Card.TLabel', background=white, foreground=ink)
+        style.configure('Hint.TLabel', background=white, foreground=muted, font=(self.ui_font, 10))
+        style.configure('Step.TLabel', background=white, foreground=blue, font=(self.ui_font, 13, 'bold'))
+        style.configure('Warning.TLabel', background='#fff4dc', foreground='#835711', padding=10)
+        style.configure('TButton', font=(self.ui_font, 11), padding=(12, 8),
+                        background='#e9effa', foreground=ink, borderwidth=0, relief='flat')
+        style.map('TButton', background=[('disabled', '#f0f3f8'), ('pressed', '#cbdaf3'), ('active', '#dce7fa')],
+                  foreground=[('disabled', '#94a1b5')])
+        style.configure('Accent.TButton', background=blue, foreground=white, font=(self.ui_font, 11, 'bold'))
+        style.map('Accent.TButton', background=[('disabled', '#dce6f7'), ('pressed', '#1e40af'), ('active', '#3b76ee')],
+                  foreground=[('disabled', '#8197bc'), ('!disabled', white)])
+        style.configure('TEntry', padding=8, fieldbackground='#f6f8fc', foreground=ink, bordercolor='#dce4f0')
+        style.map('TEntry', fieldbackground=[('readonly', '#f6f8fc')])
+        style.configure('TCombobox', padding=7, fieldbackground='#f6f8fc', background='#e9effa',
+                        foreground=ink, arrowcolor=blue, bordercolor='#dce4f0')
+        style.map('TCombobox', fieldbackground=[('readonly', '#f6f8fc')],
+                  selectbackground=[('readonly', '#f6f8fc')], selectforeground=[('readonly', ink)])
+        style.configure('Horizontal.TProgressbar', background=blue, troughcolor='#e3eaf5',
+                        borderwidth=0, lightcolor=blue, darkcolor=blue, thickness=6)
+        style.configure('TScrollbar', background='#cbd7e9', troughcolor=background,
+                        borderwidth=0, arrowcolor=muted)
         shell = ttk.Frame(root)
         shell.pack(fill='both', expand=True)
         shell.rowconfigure(0, weight=1)
         shell.columnconfigure(0, weight=1)
-        self.canvas = tk.Canvas(shell, highlightthickness=0, yscrollincrement=20,
-                                background=style.lookup('TFrame', 'background') or '#f0f0f0')
+        self.canvas = tk.Canvas(shell, highlightthickness=0, yscrollincrement=20, background=background)
         self.canvas.grid(row=0, column=0, sticky='nsew')
         self.vscroll = ttk.Scrollbar(shell, orient='vertical', command=self.canvas.yview)
         self.vscroll.grid(row=0, column=1, sticky='ns')
         self.hscroll = ttk.Scrollbar(shell, orient='horizontal', command=self.canvas.xview)
         self.hscroll.grid(row=1, column=0, sticky='ew')
         self.canvas.configure(yscrollcommand=self.vscroll.set, xscrollcommand=self.hscroll.set)
-        frame = ttk.Frame(self.canvas, padding=20)
+        frame = ttk.Frame(self.canvas, padding=24)
         self.content = frame
         self.content_window = self.canvas.create_window(0, 0, window=frame, anchor='nw')
-        ttk.Label(frame, text='Русское меню для XREAL One / One Pro / 1S', font=(self.ui_font, 19, 'bold')).pack(anchor='w')
-        ttk.Label(frame, text='Подключите очки по USB → выберите устройство и прошивку → установите.',
-                  wraplength=650).pack(anchor='w', pady=(10, 18))
-        ttk.Label(frame, text='1. Выберите очки').pack(anchor='w')
-        row = ttk.Frame(frame)
-        row.pack(fill='x', pady=(8, 16))
-        self.combo = ttk.Combobox(row, state='readonly', font=(self.ui_font, 11))
-        self.combo.pack(fill='x')
-        self.combo.bind('<<ComboboxSelected>>', self.selected)
+        self.labels = []
+
+        def label(parent, text='', style='Card.TLabel', **options):
+            widget = ttk.Label(parent, text=text, style=style, wraplength=640, **options)
+            self.labels.append(widget)
+            return widget
+
+        def card(number, title):
+            panel = ttk.Frame(frame, style='Card.TFrame', padding=16)
+            panel.pack(fill='x', pady=(0, 12))
+            label(panel, f'{number}   {title}', 'Step.TLabel').pack(anchor='w', pady=(0, 10))
+            return panel
+
+        label(frame, f'X R E A L   /   РУССКОЕ МЕНЮ   ·   v{VERSION}', 'Brand.TLabel').pack(anchor='w')
+        label(frame, 'Вашим очкам — новый взгляд.', 'Title.TLabel').pack(anchor='w', pady=(8, 6))
+        label(frame, 'One · One Pro · 1S   /   Подключите. Выберите. Обновите.', 'Muted.TLabel').pack(anchor='w', pady=(0, 20))
+        device = card('01', 'Подключите очки')
+        row = ttk.Frame(device, style='Card.TFrame')
+        row.pack(fill='x')
         self.refresh_button = ttk.Button(row, text='Обновить список', command=self.refresh)
-        self.refresh_button.pack(anchor='w', pady=(6, 0))
-        ttk.Label(frame, text='2. Выберите BIN-файл прошивки').pack(anchor='w', pady=(2, 8))
+        self.refresh_button.pack(side='right', padx=(10, 0))
+        self.combo = ttk.Combobox(row, state='readonly', font=(self.ui_font, 11), width=18)
+        self.combo.pack(side='left', fill='x', expand=True)
+        self.combo.bind('<<ComboboxSelected>>', self.selected)
+        label(device, 'Подключение по USB-кабелю с передачей данных.', 'Hint.TLabel').pack(anchor='w', pady=(8, 0))
+        firmware = card('02', 'Выберите прошивку')
         self.firmware = None
         self.firmware_path = None
-        self.file_name = tk.StringVar(value='Файл не выбран')
-        ttk.Entry(frame, textvariable=self.file_name, state='readonly').pack(fill='x')
-        self.browse_button = ttk.Button(frame, text='Выбрать BIN…', command=self.choose_firmware)
-        self.browse_button.pack(anchor='w', pady=(6, 8))
-        ttk.Label(frame, text='…или скачайте прошивку прямо из релизов GitHub проекта (davnozdu).').pack(anchor='w', pady=(2, 6))
-        github_row = ttk.Frame(frame)
-        github_row.pack(fill='x', pady=(0, 8))
-        self.release_combo = ttk.Combobox(github_row, state='readonly', font=(self.ui_font, 11))
+        self.file_name = tk.StringVar(value='BIN-файл ещё не выбран')
+        local_row = ttk.Frame(firmware, style='Card.TFrame')
+        local_row.pack(fill='x')
+        self.browse_button = ttk.Button(local_row, text='Выбрать BIN…', command=self.choose_firmware)
+        self.browse_button.pack(side='right', padx=(10, 0))
+        ttk.Entry(local_row, textvariable=self.file_name, state='readonly', width=18).pack(side='left', fill='x', expand=True)
+        label(firmware, 'ИЛИ СКАЧАЙТЕ ИЗ РЕЛИЗОВ ПРОЕКТА', 'Hint.TLabel').pack(anchor='w', pady=(14, 7))
+        self.release_combo = ttk.Combobox(firmware, state='readonly', font=(self.ui_font, 11))
         self.release_combo.pack(fill='x')
         self.release_combo.bind('<<ComboboxSelected>>', self.release_selected)
-        self.fetch_button = ttk.Button(github_row, text='Обновить список с GitHub', command=self.fetch_releases)
-        self.fetch_button.pack(anchor='w', pady=(6, 0))
+        github_row = ttk.Frame(firmware, style='Card.TFrame')
+        github_row.pack(fill='x', pady=(8, 0))
+        self.fetch_button = ttk.Button(github_row, text='Релизы на GitHub', command=self.fetch_releases)
+        self.fetch_button.pack(side='left')
         self.download_button = ttk.Button(github_row, text='Скачать и проверить', command=self.download_selected, state='disabled')
-        self.download_button.pack(anchor='w', pady=(6, 0))
+        self.download_button.pack(side='left', padx=(10, 0))
         self.release_assets = []
-        self.description = ttk.Label(frame, wraplength=640, justify='left')
-        self.description.pack(anchor='w', pady=(5, 10))
-        ttk.Label(frame, text='Приложение скачивает прошивку только с GitHub проекта и проверяет формат, '
-                  'контрольные суммы и совместимость BIN перед записью. Русский заменяет польский язык, '
-                  'английский сохраняется.',
-                  wraplength=640).pack(anchor='w')
-        ttk.Label(frame, text='Закройте страницу обновления XREAL. Не отключайте USB-кабель во время записи.',
-                  foreground='#6b4c16', wraplength=640).pack(anchor='w', pady=(10, 14))
-        self.install_button = ttk.Button(frame, text='3. Установить выбранную прошивку', command=self.start, state='disabled')
+        self.description = label(firmware, justify='left', style='Hint.TLabel')
+        self.description.pack(anchor='w', pady=(10, 0))
+        install = card('03', 'Всё готово к обновлению?')
+        label(install, 'Перед записью проверим формат, контрольные суммы и совместимость BIN. '
+              'Русский заменит польский, английский останется.', 'Hint.TLabel').pack(anchor='w', pady=(0, 12))
+        self.install_button = ttk.Button(install, text='Установить прошивку', style='Accent.TButton', command=self.start, state='disabled')
         self.install_button.pack(anchor='w')
-        self.verify_button = ttk.Button(frame, text='Проверить без записи', command=lambda: self.start(verify_only=True), state='disabled')
+        self.verify_button = ttk.Button(install, text='Проверить без записи', command=lambda: self.start(verify_only=True), state='disabled')
         self.verify_button.pack(anchor='w', pady=(6, 0))
+        label(frame, 'Не отключайте USB во время записи. Закройте другие обновляторы XREAL.', 'Warning.TLabel').pack(fill='x', pady=(0, 12))
         self.diagnostic_button = ttk.Button(frame, text='Диагностика / отчёт об ошибке…', command=self.show_diagnostics)
-        self.diagnostic_button.pack(anchor='w', pady=(6, 0))
+        self.diagnostic_button.pack(anchor='w')
         self.progress = ttk.Progressbar(frame, maximum=100)
-        self.progress.pack(fill='x', pady=(18, 10))
+        self.progress.pack(fill='x', pady=(14, 8))
         self.status = tk.StringVar(value='Поиск подключённых очков…')
-        self.status_label = ttk.Label(frame, textvariable=self.status, wraplength=640)
+        self.status_label = label(frame, textvariable=self.status, style='Muted.TLabel')
         self.status_label.pack(anchor='w')
-        self.labels = [child for child in frame.winfo_children() if isinstance(child, ttk.Label)]
         self.firmware_changed()
         self.canvas.bind('<Configure>', self.layout)
         frame.bind('<Configure>', self.content_changed)
@@ -238,7 +279,7 @@ class App:
         width = max(available, minimum)
         self.canvas.itemconfigure(self.content_window, width=width)
         for label in self.labels:
-            label.configure(wraplength=max(80, width-40))
+            label.configure(wraplength=max(80, width-96))
         if width > available:
             self.hscroll.grid()
         else:
@@ -561,7 +602,20 @@ def main():
         root = tk.Tk()
         root.withdraw()
         app = App(root)
+        tcl_version = str(root.tk.call('info', 'patchlevel'))
+        tk_version = str(root.tk.call('package', 'provide', 'Tk'))
+        if sys.platform == 'darwin':
+            from check_macos_runtime import validate_versions
+            validate_versions(tcl_version, tk_version)
+        root.deiconify()
         root.update_idletasks()
+        app.canvas.yview_moveto(0)
+        root.update_idletasks()
+        ui_visible = all(widget.winfo_ismapped() and widget.winfo_width() > 1
+                         and widget.winfo_height() > 1
+                         for widget in (app.canvas, app.content, app.combo, app.browse_button))
+        if not ui_visible:
+            raise RuntimeError('GUI self-test failed: firmware controls are not mapped')
         found = backend.devices()
         count = len(found)
         root.destroy()
@@ -585,6 +639,7 @@ def main():
                                         firmware=selected_firmware)
         dest.write_text(json.dumps({'ok': True, 'firmwares': reports,
                                     'hid_devices': count, 'tk_loaded': True, 'firmware_writes': 0,
+                                    'ui_visible': ui_visible, 'tcl_version': tcl_version, 'tk_version': tk_version,
                                     'version': VERSION, 'abi_preflight': abi_preflight,
                                     'device_identity': device_identity}), encoding='utf-8')
         return

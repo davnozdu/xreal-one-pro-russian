@@ -9,12 +9,34 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."           # repo root
 ROOT="$(pwd)"
-VENV="$ROOT/work/installer-venv"
+# Never reuse the CLT Python/Tk 8.5 environment: it can build successfully
+# while producing an empty window on current macOS.
+CHECK="$ROOT/installer/check_macos_runtime.py"
+VENV="$ROOT/work/installer-macos-venv"
 PY="$VENV/bin/python"
-
-if [ ! -x "$PY" ]; then
-    python3 -m venv "$VENV"
+if [ -n "${PYTHON:-}" ]; then
+    "$PYTHON" "$CHECK"
+    BUILD_PYTHON="$PYTHON"
+else
+    BUILD_PYTHON=""
+    for candidate in python3 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" "$CHECK" >/dev/null 2>&1; then
+            BUILD_PYTHON="$candidate"
+            break
+        fi
+    done
+    if [ -z "$BUILD_PYTHON" ]; then
+        echo 'A Python with Tcl/Tk >= 8.6 is required. Apple CLT Python is unsupported.' >&2
+        echo 'Install Python from python.org or brew install python-tk@3.11.' >&2
+        echo 'Then run: PYTHON=/path/to/python3 bash installer/build_macos.sh' >&2
+        exit 1
+    fi
 fi
+if [ ! -x "$PY" ] || ! "$PY" "$CHECK" >/dev/null 2>&1 || \
+   [ "$("$PY" -c 'import sys; print(sys._base_executable)')" != "$("$BUILD_PYTHON" -c 'import sys; print(sys._base_executable)')" ]; then
+    "$BUILD_PYTHON" -m venv --clear "$VENV"
+fi
+"$PY" "$CHECK"
 "$PY" -m pip install --quiet --upgrade pip
 "$PY" -m pip install --quiet -r installer/requirements.txt
 
@@ -40,7 +62,7 @@ echo "== PyInstaller ($NAME) =="
     --specpath "$ROOT/work" \
     installer/app.py
 
-# Smoke-test the bundled app: the headless self-test parses a real BIN that is
+# Smoke-test the bundled app: the self-test maps the real GUI and parses a BIN
 # committed in the repo, writes a JSON report, and performs zero firmware
 # writes. This proves PyInstaller bundled every module (backend, hid, tkinter,
 # updates) before we ship the .app. No device and no network are needed.
@@ -54,9 +76,9 @@ for attempt in 1 2 3; do
     echo "self-test attempt $attempt failed; retrying"; sleep 2
     [ "$attempt" = 3 ] && { echo "self-test failed 3 times"; exit 1; }
 done
-"$PY" -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['ok'] and d['firmware_writes']==0,d;print('self-test ok:',d['version'])" "$REPORT"
+"$PY" -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['ok'] and d['firmware_writes']==0 and d['ui_visible'] and tuple(map(int,d['tk_version'].split('.')[:2])) >= (8,6),d;print('self-test ok:',d['version'])" "$REPORT"
 rm -f "$REPORT"
 
-cp installer/PACKAGE-README.md "$DEST/README.md" 2>/dev/null || true
+cp installer/MACOS-README.md "$DEST/README.md"
 ( cd "$DEST" && /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$NAME.app" "$NAME-macos.zip" )
 echo "Built: $DEST/$NAME.app  ->  $DEST/$NAME-macos.zip"

@@ -44,10 +44,40 @@ def validate_build(build, firmware_key, pilot):
         raise ValueError('Неподдерживаемая библиотека сравнения Real3D.')
 
 
-def export_file(probe, path, maximum=8*1024*1024):
+BUSY = 1
+START_REASONS = {1: 'устройство занято прерванным чтением',
+                 16: 'файл не найден'}
+
+
+def reset_export(probe):
+    """Close a stale export session before reading; best effort only."""
+    reset = getattr(probe, 'reset_export', None)
+    if reset is not None:
+        try:
+            reset()
+        except Exception:
+            pass
+
+
+def status_text(response):
+    start = response.get('start_status', 0)
+    if start:
+        return f" (код {start}: {START_REASONS.get(start, 'ошибка устройства')})"
+    finish = response.get('finish_status', 0)
+    return f' (код завершения {finish})' if finish else ''
+
+
+def export_file(probe, path, maximum=8*1024*1024,
+                message='Не удалось прочитать для проверки совместимости: '):
+    reset_export(probe)
     response = probe.export(path, max_bytes=maximum)
+    if response['start_status'] == BUSY:
+        # A read interrupted earlier leaves its session open, and the device
+        # rejects every later export until a finish command clears it.
+        reset_export(probe)
+        response = probe.export(path, max_bytes=maximum)
     if response['start_status'] != 0 or response.get('finish_status') != 0:
-        raise RuntimeError('Не удалось прочитать для проверки совместимости: '+path)
+        raise RuntimeError(message + path + status_text(response))
     with zipfile.ZipFile(io.BytesIO(response['data'])) as archive:
         matches = [i for i in archive.infolist()
                    if not i.is_dir() and i.filename.rsplit('/', 1)[-1] == path.rsplit('/', 1)[-1]]
