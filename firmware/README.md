@@ -28,6 +28,18 @@ and deterministic repackaging of those inputs.
 Host tests cannot establish performance on the glasses. Stable Real3D 60 fps
 is an acceptance target, not a result of this release.
 
+## Root shell / SSH
+
+Perf builds since perf37 also carry `firmware/shell_bootstrap.c` in
+`libxreal_cpu_adapter.so`. The adapter constructor runs once per Pilot start as
+root and prepares dropbear (root password hash in `/etc/passwd`, authorized key,
+runit `down` marker renamed, `u` written to `supervise/control`). It only calls
+`open/read/write/close/rename` from the pinned device ABI — no fork, threads,
+malloc or stdio — so it cannot stall the renderer; status lands in
+`/usrdata/shell-bootstrap.log`, which is readable over the USB HID export
+command. Credentials, the login procedure, what to undo and how to roll back are
+in [ROOT-SHELL.md](ROOT-SHELL.md).
+
 ## Pinned inputs
 
 | Input | SHA256 |
