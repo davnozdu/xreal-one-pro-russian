@@ -35,6 +35,7 @@
 | `AR_MPI_VB_SetModPoolConfig(uid=3, &cfg)` | `-1` на «живом» демоне, `0` на только что загруженном |
 | `AR_MPI_VB_InitModCommPool(uid=3)` | `0` (ioctl `_IOW('b',14,4)` = `0x4004620e`) |
 | **`AR_MPI_VDEC_CreateChn(0..39, &attr)`** | **блокируется навсегда** (см. п. 4) |
+| `AR_MPI_VDEC_AttachVbPool` | второй аргумент — указатель на 8-байтную пару `{u32 picPool; u32 tmvPool}`; передача `int` — ABI-ошибка |
 | `AR_MPI_VDEC_AttachVbPool` **до** `CreateChn` | блокируется навсегда, демон после этого заклинен до перезагрузки |
 
 Раскладка `VDEC_CHN_ATTR` восстановлена по дизассемблеру `AR_MPI_VDEC_CreateChn` и **отличается
@@ -60,8 +61,13 @@
 
 `AR_MPI_VDEC_CreateChn` не возвращает управление никогда. Диагностика:
 
-* `/proc/<pid>/wchan` = **`request_wait_answer`** → ожидание ответа **binder**-транзакции;
-  `/proc/<pid>/syscall` = `ioctl(11, 0xc018410f, ...)`, fd 11 = `/dev/binder`.
+* `/proc/<pid>/wchan` = **`request_wait_answer`** (функция FUSE/CUSE, не binder);
+  `/proc/<pid>/syscall` = `ioctl(11, 0xc018410f, ...)`, **fd 11 = `/dev/vctrl`** — CUSE-устройство,
+  которое обслуживает `mpp_service.app` (у демона ~25 fd на `/dev/cuse`, 49 потоков).
+* В залипшем процессе **ровно 1 поток**: пул коллбеков, который `VDEC_Init` должен поднимать для
+  обратных вызовов из демона, не создан. Наш пробник собран freestanding (`-nostdlib`, голый `_start`,
+  без `__libc_start_main`), поэтому pthread/stdio не инициализированы — это наиболее вероятная причина
+  залипания, а не параметры канала.
 * Демон `mpp_service.app`, запущенный вручную с перехватом stdout/stderr, за время нашего запроса
   **не печатает ни одной строки про VDEC** (в логе 12 000 строк — только аудио `AIO_HAL` и `GDC`);
   то есть запрос либо не доходит до кодека, либо обслуживается не тем процессом.
@@ -132,9 +138,12 @@
 `AR_MPI_VB_CreatePool` → valid id, `AR_MPI_VB_Init` → 0, `AR_MPI_VB_InitModCommPool(3)` → 0.
 `AR_MPI_VB_SetConfig` → −1 (ioctl `_IOW('b',0,648)`).
 
-**Blocker:** `AR_MPI_VDEC_CreateChn` never returns. The process sleeps in binder
-(`/proc/<pid>/wchan` = `request_wait_answer`, syscall = `ioctl(/dev/binder, 0xc018410f)` — that is the
-VDEC give-cmd `_IOWR('A',15,24)`). The `mpp_service.app` daemon, started manually with stdout captured,
+**Blocker:** `AR_MPI_VDEC_CreateChn` never returns. The process sleeps in CUSE
+(`wchan = request_wait_answer`, syscall = `ioctl(/dev/vctrl, 0xc018410f)` — the VDEC give-cmd
+`_IOWR('A',15,24)`); `/dev/vctrl` is served by `mpp_service.app` (25 `/dev/cuse` fds, 49 threads).
+The blocked process has a single thread, i.e. the callback thread pool that `VDEC_Init` is meant to
+start never appeared — our probe is freestanding (`-nostdlib`, bare `_start`, no `__libc_start_main`),
+so pthread/stdio are uninitialised. This is the prime suspect, not the channel parameters. The `mpp_service.app` daemon, started manually with stdout captured,
 logs nothing about VDEC during the request. Control test: the same probe without any VB calls
 (only `SYS_Init` → `VDEC_Init(40)` → `CreateChn`) against the **fully running** vendor stack (daemon,
 `media_service`, `pilot`) also hangs, and the stack survives — so it is not a VB provisioning problem
