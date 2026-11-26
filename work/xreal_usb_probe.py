@@ -26,6 +26,9 @@ class Probe:
         return self
 
     def __exit__(self, *args):
+        # Never leave an export session open: the device accepts one at a time
+        # and would reject every later read from this or any other host.
+        self.reset_export()
         self.device.close()
 
     def query(self, command, payload=b'', timeout=4):
@@ -67,6 +70,21 @@ class Probe:
             return dict(command=command, status=data[22], payload=data[23:5+length],
                         response_crc32_verified=True, ignored_reports=ignored)
         raise TimeoutError(f'No response to command 0x{command:04x}; ignored={ignored}')
+
+    def reset_export(self):
+        """Finish an export session left open by an interrupted read.
+
+        The glasses serve one export session at a time: while a stale session is
+        open every new read is rejected with status 1. A finish command on an
+        idle device is harmless and returns status 0.
+        """
+        for _ in range(2):
+            try:
+                self.query(209)
+                return True
+            except Exception:
+                continue
+        return False
 
     def export(self, remote_path, max_bytes=2*1024*1024):
         start = self.query(207, remote_path.encode(), timeout=180)
