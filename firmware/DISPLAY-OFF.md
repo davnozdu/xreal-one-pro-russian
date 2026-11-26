@@ -64,55 +64,87 @@ Hertz: 60
 ### 2. Выключить выход на очки
 
 ```
-displayplacer "serial:s0 enabled:false"
+displayplacer "id:5B3B753B-D2F4-4E58-8853-ED2ED5DDD783 enabled:false"
 ```
 
-Эквиваленты: `displayplacer "id:5B3B753B-D2F4-4E58-8853-ED2ED5DDD783 enabled:false"`
-или `displayplacer "id:2 enabled:false"`.
-
-Признак успеха — панель очков чёрная, а `displayplacer list` больше не показывает
-XREAL. Строки вида
+Проверено на живом прогоне. Команда печатает несколько одинаковых строк и
+возвращает **код выхода 1**:
 
 ```
-Unable to find screen 5B3B753B-… - skipping changes for that screen
+Unable to find screen 5B3B753B-D2F4-4E58-8853-ED2ED5DDD783 - skipping changes for that screen
+Unable to find screen 5B3B753B-D2F4-4E58-8853-ED2ED5DDD783 - skipping changes for that screen
+...
+exit=1
 ```
 
-это **не ошибка**: экран уже отключён, поэтому его и не находят. Повторный вызов
-команды на уже выключенном выходе даёт именно это сообщение.
+**Это успех, а не ошибка.** `displayplacer` сначала применяет конфигурацию (дисплей
+снимается с хоста), а затем заново резолвит id уже в новом состоянии — и, естественно,
+не находит. Ровно так же ведёт себя вызов на уже отключённом выходе. Проверять надо не
+код выхода, а список экранов (шаг 3). Эквивалентные адреса: `id:2` (contextual) и
+`serial:s0`.
 
 ### 3. Проверить, что состояние нужное
 
-На Mac:
+На Mac — вот что показал прогон после команды:
 
 ```
-displayplacer list | grep -c "1920x1080"      # 0 — очков в списке нет
-system_profiler SPDisplaysDataType | grep -c Resolution   # только встроенный экран
+$ displayplacer list | grep -cE "105 inch"
+0                                        # очков в списке больше нет
+
+$ displayplacer list
+Persistent screen id: 37D8832A-2D66-02CA-B9F7-8F30A301B230
+Type: MacBook built in screen
+Resolution: 1728x1117
+...
+
+$ system_profiler SPDisplaysDataType | grep "Display Type"
+Display Type: Built-in Liquid Retina XDR Display     # единственный дисплей
 ```
 
-На очках (SSH продолжает работать):
+На очках (SSH в этот момент продолжает работать):
 
 ```
-dmesg | tail -20        # ожидаемо: coconut_typec_reset_assert / dprx_init_phy / deassert
-cat /sys/class/extcon/*/state   # DP=1 — линк держится
+$ cat /sys/class/extcon/extcon0/state
+DP=1                                  # линк Type-C/DP держится
+$ ps w | awk '/[p]ilot$/ {print $1, $3}'
+246 runsv
+549 /usrdata/pilot/bin/pilot           # пилот жив
 ```
 
-Глазами: панель чёрная, интерфейс пилота (кнопка на дужке) отвечает.
+Глазами: на панели надпись «Нет видеосигнала», на кнопку на дужке пилот отвечает.
 
-### 4. Вернуть картинку
+### 4. Как вернуть картинку
+
+Из этого состояния **`displayplacer` картинку не возвращает** — проверено:
 
 ```
-displayplacer "serial:s0 enabled:true"
+$ displayplacer "id:5B3B753B-… enabled:true"
+Unable to find screen 5B3B753B-… - skipping changes for that screen
+exit=1
+$ displayplacer "id:37D8832A-… enabled:true" "id:5B3B753B-… enabled:true"
+Screen ID 37D8832A-…: could not find res:0x0 scaling:off
+Unable to find screen 5B3B753B-… - skipping changes for that screen
+exit=1
 ```
 
-Если экран не находится и после этого — переподключить кабель: macOS пересоздаёт
-запись дисплея только при переинициализации Type-C/DP-PHY.
+Хост уже забыл экран, поэтому и включить его не может. HPD-импульс со стороны очков
+(`dpctl off` → `dpctl on` по `/dev/ar_dprx`) хост тоже не заставляет переобнаружить
+дисплей. Работает только физическое переподключение кабеля USB-C: Type-C/DP-PHY
+переинициализируется, macOS создаёт запись дисплея заново и возвращает картинку.
 
 ### Почему у другой модели не получается
 
-Скорее всего пробуют гасить картинку **на самих очках** — через HPD, VO-слои или
-убивая `media_service`. Это не работает (таблица выше): DP-поток идёт мимо VO-слоёв,
-HPD только моргает линком, а `media_service` оставляет последний кадр замороженным.
-Гасить нужно выход на хосте.
+Три типовые причины, все проверены на этом устройстве:
+
+1. **Ориентируются на код выхода.** `displayplacer` при успешном отключении возвращает
+   `1` и печатает «Unable to find screen … skipping changes». Если это принять за
+   ошибку, делается вывод «дисплей не отключается» — хотя он уже отключён.
+2. **Пытаются гасить на самих очках** — HPD (`/dev/ar_dprx`), VO-слои, `kill -9
+   media_service`. Не работает: DP-поток идёт мимо VO-слоёв, HPD только моргает
+   линком, `media_service` оставляет последний кадр замороженным (таблица выше).
+3. **Пытаются потом включить обратно тем же `displayplacer`** и, не получив картинку,
+   считают, что и отключение не сработало. Обратный путь — только переподключение
+   кабеля.
 
 Резервный путь, если хост недоступен: подключить очки кабелем/адаптером **без
 DisplayPort alt-mode** (только питание и USB-данные) — получится тот же чёрный экран
