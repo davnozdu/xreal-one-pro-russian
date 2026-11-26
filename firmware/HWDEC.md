@@ -1,0 +1,273 @@
+# Аппаратный декодер видео на XREAL One Pro — что выяснено и как это включить
+
+Состояние на 26.11.2026. Всё ниже — либо проверено на очках, либо восстановлено по байтам
+дизассемблером (тогда помечено «из бинаря»). Непроверенное помечено `TODO`.
+
+---
+
+## 1. TL;DR
+
+Плеер тормозит не потому, что он плохой, а потому что аппаратный декодер к нему не подключён,
+и подключить его «сбоку» к работающему вендорному стеку нельзя. Схема такая:
+
+* Железный декодер есть: `AR_MPI_VDEC_*` (VPU H.264/H.265) + `ar_scaler` для масштаба + `VO` для вывода.
+* FFmpeg в прошивке собран **без** hwaccel, `/dev/video*` нет → программный путь единственный, что есть у плеера.
+* MPP на этих очках работает как **единственный владелец на загрузку**: клиент делает `SYS_Init`, становится
+  мастером и поднимает in-process сервис (CUSE-узлы, `/dev/mem`, клоки, дисплей). Второй процесс, сделавший
+  `SYS_Init`/`CreateChn`, конфликтует с владельцем и **навсегда залипает** в ioctl демона.
+* Значит аппаратное декодирование возможно только в режиме «наш процесс — единственный владелец»:
+  остановить `pilot` + `media_service`, перезапустить демон MPP, запустить наш бинарь, потом вернуть стек.
+* На этом пути уже пройдено: `SYS_Init`, `VDEC_Init`, создание своего VB-пула и валидация канала декодера.
+  Текущий затык — каналу VDEC нужен общий VB-пул модуля, `VB_InitModCommPool` с найденным uid не принимается.
+
+---
+
+## 2. Железо и стек
+
+| Что | Значение |
+|---|---|
+| Устройство | XREAL One Pro, SKU `X1112011` |
+| SoC | Artosyn **AR9481**, `15.1.03.603_20260914`, chipId `0x3536f93` |
+| SDK | `ar9481-ar-sdk-0.17.45-18-mp` |
+| Pilot | `2.0.0.20260920102250` |
+| ОС | Linux, glibc 2.25, `/lib/ld-2.25.so` |
+| Root/SSH | `root@169.254.1.1`, ключ `~/.ssh/xreal_onepro` (бутстрап в `firmware/shell_bootstrap.c`) |
+
+Блоки MPP, инициализируются при загрузке (по `dmesg`): `VDEC H264D JPEGD VFMW VGS VENC H265E H264E VPSS
+VO DIS AI AO AENC RC`, плюс аудио-декодер `ADEC`.
+
+Библиотеки в `/usr/lib/` (у всех **пустой DT_SONAME** — линковать только по имени файла `-l:libmpi_vdec.so`):
+
+```
+libmpi_sys.so  libmpi_vdec.so  libmpi_vb.so   libmpi_vpss.so  libmpi_vo.so   libmpi_vgs.so
+libmpi_scaler.so libmpi_adec.so libmpi_aenc.so libmpi_ai.so   libmpi_ao.so
+libhal_*.so (hal_vdec, hal_vb, hal_sys, hal_adec, hal_aio, ...)
+libmpp_service.so, libosal.so, libutils.so, librpc_proxy.so
+```
+
+Вендорные обёртки в `/usrdata/pilot/bin/`:
+
+* `libxrlinux_codec.so` — C++-обёртка `XrlinuxCodec*` (`XrlinuxCodecCreateDecoder`, `XrlinuxTestVbInit`,
+  `XrlinuxCodecSendPacketBuffer`, `XrlinuxCodecAcquireFrameBuffer`, …); внутри dlsym'ит `libmpi_*` и
+  зовёт `AR_MPI_*`; в её коде видна правильная последовательность VB.
+* `libxr_codec.so` — слой пилота, который dlsym'ит `XrlinuxCodec*` (то есть штатный аппаратный путь идёт через неё).
+
+Узлы: `/dev/vdecN`, `/dev/ar_vb`, `/dev/mmz_userdev`, `/dev/ar_sys`, `/dev/ar_region`, `/dev/binder`,
+`/dev/ao`, `/dev/ai`, `/dev/acodec`, `/dev/arscaler`. Драйверный ioctl вызова VDEC — `_IOWR('A',15,24)` = `0xc018410f`.
+
+---
+
+## 3. Почему плеер тормозит (корень проблемы)
+
+1. Обе сборки ffmpeg в прошивке собраны **без** аппаратных ускорителей: в `config.h` — `--disable-hwaccels`,
+   у системной 6.1 ещё и `--disable-v4l2-m2m`.
+2. `/dev/video*` отсутствует → V4L2 M2M тоже недоступен.
+3. Кодек занят вендорным владельцем (`media_service`, который поднят раньше пилота и держит MPP),
+   и договориться с ним нельзя (см. п. 4).
+
+Отсюда: единственный реальный путь — **свой декодер, который сам владеет MPP**, и запуск его как отдельного
+режима (штатный UI на это время остановлен).
+
+---
+
+## 4. Режим «единственный владелец» — как безопасно тестировать
+
+Сервисы и управление:
+
+```
+/etc/services/{pilot,media_service,mpp_service,usb_gadget_service}   # каталоги runit
+/usr/usrdata/bin/runit/sv                    # клиент sv
+```
+
+Во всех трёх каталогах лежит маркер `down` — это **нормальное** состояние: их поднимает продуктовый скрипт,
+а не runit при загрузке. Поэтому `sv stop` не ломает следующий бут.
+
+Рабочий цикл (реализован в `firmware/hwdec/t1.sh`):
+
+```sh
+SV=/usr/usrdata/bin/runit/sv
+$SV stop /etc/services/media_service        # снять владельца кодека
+$SV stop /etc/services/pilot                # снять UI (иначе он держит дисплей)
+sleep 2
+kill -9 $(ps w | awk '/[m]edia_service/ {print $1}') 2>/dev/null   # добить хвосты
+kill -9 $(ps w | awk '/[m]pp_service.app/ {print $1}') 2>/dev/null # свежий демон MPP без мусора
+$SV up /etc/services/mpp_service
+sleep 3
+# ... наш бинарь ...
+$SV start /etc/services/media_service
+$SV start /etc/services/pilot
+```
+
+Важные правила, добытые ценой залипаний:
+
+* **Проверять, что владелец реально мёртв** перед пробой: `ps w | awk '/[m]edia_service|[p]ilot$/'`.
+  Супервизор поднимает сервис обратно, если он был в состоянии `up` — поэтому именно `sv stop`, а не `kill`.
+* **Залипший процесс не убивается `kill -9`** (D-state) и держит файл занятым. Лечится перезапуском демона:
+  `kill -9 <mpp_service.app>; sv up /etc/services/mpp_service`. Перезагрузка очков нужна только если и это не помогло.
+* Бинарь на устройстве при залипшем прошлом экземпляре копируется под **новым именем** (`/tmp/pd3`), иначе
+  `scp: Text file busy`.
+* Никогда не вызывать `SYS_Exit`/`VB_Exit` из нашего процесса при живом вендорном стеке — это сносит общее состояние.
+
+---
+
+## 5. ABI, восстановленный по байтам
+
+### 5.1 `VDEC_CHN_ATTR` — 88 байт (раскладка **AR9481**)
+
+Ключевое отличие от опубликованного реверса под Proxima-9311: у нас **нет поля `enVBSource`**, вся структура
+сдвинута на 4 байта. Из-за этого чужая документация здесь неверна и вводит в заблуждение.
+
+```c
+struct attr {                     /* 88 bytes */
+    u32 enType;          /* +0  : 96 = H.264, 265 = H.265, 26 = JPEG, 1002 = MJPEG */
+    u32 enMode;          /* +4  : 0 = frame mode */
+    u32 picWidth;        /* +8  : МАКСИМАЛЬНАЯ ширина (cap под буферы), не выходная */
+    u32 picHeight;       /* +12 : максимальная высота */
+    u32 streamBufSize;   /* +16 : ring битстрима, ДОЛЖЕН быть > 0x8000 (32 КБ) */
+    u32 frameBufSize;    /* +20 */
+    u32 frameBufCnt;     /* +24 */
+    u32 refFrameNum;     /* +28 */
+    u32 temporalMvp;     /* +32 */
+    u32 tmvBufSize;      /* +36 */
+    u32 cmdQueueDepth;   /* +40 */
+    u32 reserved[11];    /* +44..+87 */
+};
+```
+
+Чем подтверждено: в `AR_MPI_VDEC_CreateChn` (`libmpi_vdec.so` @ `0x6b60`, длина `0x728`) есть
+`ldr w7,[x19,#0x10]; cmp w7,#8,lsl#12; b.ls → 0x71d0`, а на `0x71d0` формируется ошибка `0x80058403`.
+То есть поле **+16** обязано быть больше 32768, иначе «нелегальный параметр». Проверка типов идёт по
+`0x60` (H.264), `0x109` (H.265), `0x3ea`, `0x1a` (JPEG). Ограничение канала: `cmp w20,#0x27` → chn ≤ 39.
+
+### 5.2 `VDEC_STREAM_S` — 48 байт
+
+```c
+struct vdec_stream {           /* 48 bytes */
+    u32 len;        /* +0  : длина чанка, сверяется с streamBufSize канала */
+    u32 pad;
+    u64 phyAddr;    /* +8  : zero-copy режим (phys адрес MMZ) */
+    u64 pts;        /* +16 */
+    u32 endOfFrame; /* +24 : флаг границы кадра (в чужом реверсе указан +20 — проверить) */
+    u32 rsv;
+    u32 virLo;      /* +32 : copy-режим, CPU-указатель, младшие 32 бита */
+    u32 virHi;      /* +36 : старшие 32 бита */
+    u32 rsv2[2];
+};
+```
+
+Либо `phyAddr` (zero-copy), либо `virLo/virHi` (MPI сам копирует в ring и чистит кэш).
+
+### 5.3 `VIDEO_FRAME_INFO` из `GetFrame` (полезные смещения, из бинаря и реверса)
+
+```
++4    u32 width          (реальная ширина декодированного кадра)
++8    u32 height
++16   u32 enPixelFormat  (0x16/0x17 — YUV420 semi-planar, 0x18 — 422-семейство, 0x3c — fallback)
++144  u64 phy Y
++152  u64 phy U
++160  u64 phy V
++356  u32 stride Y
++360  u32 stride U
++364  u32 stride V
+```
+
+Кадры лежат в MMZ по физическим адресам; читать через `AR_MPI_SYS_MmapCache(phys, size)`.
+
+### 5.4 VB (видео-буферы)
+
+Два разных формата, их легко перепутать:
+
+* Аргумент `AR_MPI_VB_CreatePool` — **40 байт**: `u64 blkSize @0`, `u32 blkCnt @8`, `u32 remapMode @12`,
+  `char mmzName[24] @16`. Подтверждено кодом вендорной обёртки (`libxrlinux_codec.so` @ `0x291c0`).
+* Файл `/tmp/vb_config_file` — это **другое**: 8 записей по **48 байт**: `u64 index @0`, `u64 blkSize @8`,
+  `u64 blkCnt @16`, `name[24] @24`. Это таблица конфигурации, которую читает `libxr_mpp_vb_config.so`,
+  а не аргумент `CreatePool`.
+* `VB_CONFIG_S` (для `VB_SetConfig`) — 648 байт: `u32 maxPoolCnt @0`, далее `commPool[16]` по 40 байт.
+
+Текущие пулы на живой системе (из `/tmp/vb_config_file`): 4 КБ×50, 4 КБ×1, 10.6 МБ×5, 395 КБ×7,
+6.6 МБ×10, 2.2 МБ×4, 5.1 МБ×5, 16 КБ×5.
+
+### 5.5 Коды ошибок VDEC
+
+| Код | Значение |
+|---|---|
+| `0x80058400` | invalid param (общий) |
+| `0x80058402` | (встречается в ветке проверки) |
+| `0x80058403` | на нашем железе = «поле +16 (streamBufSize) ≤ 32 КБ» либо неизвестный enType |
+
+В десятичном виде `0x80058403` = `-2147122173` — именно это мы видели при неверной раскладке структуры.
+
+### 5.6 Правильная последовательность (рабочая модель)
+
+```
+SYS_Init → [VB: свои пулы / общий пул модуля] → VDEC_Init(chnNum)
+        → VDEC_CreateChn(chn, attr) → VDEC_AttachVbPool(chn, pool)   ← строго ПОСЛЕ создания канала
+        → VDEC_StartRecvStream(chn) → VDEC_SendStream(chn, &st, ms)
+        → VDEC_GetFrame(chn, &frame, ms) → VDEC_ReleaseFrame(chn, &frame)
+        → VDEC_StopRecvStream → DestroyChn → DetachVbPool → VB_DestroyPool
+```
+
+`AttachVbPool` **до** `CreateChn` вызывает вечное залипание демона (проверено дважды).
+
+---
+
+## 6. Журнал прогонов на очках (что уже работает)
+
+| Шаг | Результат |
+|---|---|
+| `AR_MPI_SYS_Init()` | `0` ✅ |
+| `AR_MPI_SYS_GetVersion/ChipId` (read-only, без Init) | `ar9481-ar-sdk-0.17.45-18-mp`, chipId `0x3536f93` ✅ |
+| `AR_MPI_VDEC_Init(1 или 40)` | `0` ✅ |
+| `AR_MPI_VB_CreatePool(blk=1 382 400, cnt=12)` | id `10`, `11`, `12` — пул создаётся ✅ |
+| `AR_MPI_VDEC_CreateChn` (старая раскладка, height в +16) | `0x80058403` ❌ → причина найдена, исправлено |
+| `AR_MPI_VDEC_CreateChn` (раскладка AR9481) | валидацию проходит, но **блокируется на выделении буферов** ⏳ |
+| `AR_MPI_VDEC_AttachVbPool` до `CreateChn` | вечное залипание демона ❌ (порядок исправлен) |
+| `AR_MPI_VB_SetConfig(&cfg648)` | `-1` ❌ (вероятно, демон уже сконфигурирован или формат иной) |
+| `AR_MPI_VB_Init()` | `0` ✅ |
+| `AR_MPI_VB_InitModCommPool(4)` (uid VDEC по HiSilicon-энуму) | `-1` ❌ — сейчас ищу правильный uid |
+| Живучесть после прогонов | `pilot`/`media_service` поднимаются обратно, перезагрузка требуется только при жёстком залипании ✅ |
+
+Скрипты прогона лежат рядом: `firmware/hwdec/t1.sh` (тест декодера), `firmware/hwdec/t2.sh`
+(сканирование `VB_UID`), исходник пробника — `firmware/hwdec/poc_dec.c`.
+
+---
+
+## 7. Где я сейчас (точка остановки)
+
+1. Пробник собран под устройство: `clang --target=aarch64-linux-gnu -fuse-ld=lld -nostdlib -O2`
+   + линковка со всеми `libmpi_*`/`libhal_*` по именам файлов, `--dynamic-linker=/lib/ld-2.25.so`.
+   Запускается на очках, печатает прогресс через raw `write()` (поэтому видно, на каком шаге залипло).
+2. Пройдены `SYS_Init`, `VDEC_Init`, `VB_CreatePool`; раскладка `VDEC_CHN_ATTR` исправлена, ошибка `0x8403` снята.
+3. **Активный затык:** `CreateChn` ждёт буферы, потому что у модуля VDEC нет общего VB-пула:
+   `VB_SetConfig` → `-1`, `VB_InitModCommPool(4)` → `-1`. Идёт перебор `VB_UID` 0…19 (`t2.sh`), чтобы найти
+   принимаемый uid; как только он найдётся — подставляю в `poc_dec.c` и прогоняю полный цикл «скормить ES → кадры → fps».
+4. Вендорный UI после каждого прогона возвращается (`sv start`), очки рабочие.
+
+---
+
+## 8. Дальнейший план
+
+1. Найти валидный `VB_UID` (или нужный формат `VB_CONFIG_S`) → `CreateChn` = 0.
+2. Прогнать H.264 (`sample.h264`: 1280×720, из `~/Downloads/videosample.mp4`, аудио в контейнере — MP3 48 кГц стерео)
+   через `SendStream`/`GetFrame`, снять fps и загрузку CPU. Ожидание: 60 fps при почти нулевом CPU.
+3. Видимый тест: предупредить пользователя, разбудить дисплей (снять таймаут сна / HID-событие), вывести кадр
+   через `ar_scaler` → `VO`.
+4. Аудио: `libmpi_adec` + `/dev/ao` (декодер ADEC на железе есть); для MP3 в контейнере проверить,
+   поддерживает ли ADEC MP3, иначе — софт-декод аудио (цена небольшая) с выводом в AO.
+5. Интеграция в плеер: демукс ffmpeg (без декодирования) → VDEC → scaler → VO + свой OSD.
+6. Прошивка: бинарь + runit-сервис, который останавливает `pilot`/`media_service`, отдаёт панель плееру
+   и умеет возвращаться в штатный UI.
+
+---
+
+## 9. Полезные мелочи, которые сэкономят время
+
+* Проверить, кто держит MPP: `ps w | awk '/[m]edia_service|[p]ilot$|[m]pp_service.app/'`.
+* Узнать, на чём залип процесс: `cat /proc/<pid>/wchan` (у нас — `request_wait_answer`, т.е. binder-очередь
+  демона) и `cat /proc/<pid>/syscall` (ioctl `0xc018410f`, `_IOWR('A',15,24)`).
+* Свободная медиапамять: `grep -E "ZONE:|remain" /proc/media-mem` (~50 МБ свободно при живом стеке).
+* Дизасм отдельной функции: `python sofn.py <sym> <lib.so>`; произвольный диапазон: `python dumpr.py <lib.so> <start> <end>`.
+* Сборка не требует заголовков вендора: структуры описаны в `poc_dec.c` вручную.
+* Публичный реверс того же семейства (Proxima-9311), полезен как ориентир, но **с поправкой на сдвиг структуры**:
+  `github.com/Missing-Lynk/ml-userspace` — `docs/vdec-api.md`, `docs/mpp-buffers.md`,
+  `docs/decode-display-pipeline.md`.

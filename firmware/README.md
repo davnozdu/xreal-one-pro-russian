@@ -230,3 +230,9 @@ BIN SHA256: `81a1e330aa99da478eb995520f6d92e877af22e8271dacfab01eab4b6933324a`.
 A full pre-update Pilot directory backup and install/readback reports are kept
 locally under `outputs/ui-fast-test/`. This is installation verification;
 visual/performance acceptance is still pending. Public release BINs are unchanged.
+
+## Аппаратный видеодекодер (VDEC)
+
+`HWDEC.md` — что выяснено про AR9481 VDEC: раскладка `VDEC_CHN_ATTR` (сдвиг −4 относительно
+публичного реверса Proxima), `VDEC_STREAM_S`, `VIDEO_FRAME_INFO`, VB-пулы, режим «единственный
+владелец» и безопасный цикл тестирования на очках. Пробник и скрипты прогонов — в `firmware/hwdec/`.
