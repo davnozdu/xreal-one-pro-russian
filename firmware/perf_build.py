@@ -33,6 +33,7 @@ ADAPTER = 'pilot/bin/libxreal_cpu_adapter.so'
 MANIFEST = 'pilot/xreal-build.json'
 CHECKSUMS = 'pilot/checksums.sha256'
 COMPILED = ['firmware/cpu_adapter.c', 'firmware/lut_fast.c', 'firmware/runtime.c',
+            'firmware/shell_bootstrap.c',
             'work/3d-lab/real3d_cpu.c', 'firmware/compare_ui.c', 'firmware/ui_dispatch.S',
             'firmware/onepro_warp.c']
 SOURCES = COMPILED + ['firmware/runtime.h', 'firmware/onepro_warp.h',
@@ -369,8 +370,8 @@ def build(args):
         verification='perf candidate built from rc7; physical mode/performance tests required',
         perf={'base_bin_sha256': RC7_SHA, 'base_release': original['release'],
               'changed_files': [ADAPTER, MANIFEST, CHECKSUMS],
-              'aihdr': '6-frame autotune compact16 (8-px NEON, precomputed weights) vs tetra (4-px L1-resident NEON); dynamic row scheduling; bounded log rotation',
-              'real3d_proplus': 'adaptive Q5 1D forward Z-buffer (target 38 px, cap 44 px, gain 1.8-3.2x, EMA p05/p95, background-side disocclusion fill) + cliff-guarded luma bilinear and joint U/V NEON paths, global flush, bounded log rotation',
+              'aihdr': 'compact16 (16-bit NEON, 289 KiB table, no autotune); dynamic row scheduling; dense only as fallback; whole-call stage timing',
+              'real3d_proplus': 'vectorized warp, luma bilinear displacement (NEON TBL gather), chroma vertical blend, dynamic row scheduling',
               'menu_and_osd': 'unchanged rc7 (compare_ui.c and patched libnr_osd.so)',
               'abi': abi_report})
     changed_expected = [ADAPTER, MANIFEST, CHECKSUMS]
