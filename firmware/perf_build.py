@@ -33,6 +33,7 @@ ADAPTER = 'pilot/bin/libxreal_cpu_adapter.so'
 MANIFEST = 'pilot/xreal-build.json'
 CHECKSUMS = 'pilot/checksums.sha256'
 COMPILED = ['firmware/cpu_adapter.c', 'firmware/lut_fast.c', 'firmware/runtime.c',
+            'firmware/shell_bootstrap.c',
             'work/3d-lab/real3d_cpu.c', 'firmware/compare_ui.c', 'firmware/ui_dispatch.S',
             'firmware/onepro_warp.c']
 SOURCES = COMPILED + ['firmware/runtime.h', 'firmware/onepro_warp.h',
